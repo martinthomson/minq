@@ -50,6 +50,11 @@ const (
 	kLongHeaderLength            = 12   // omits connection ID lengths
 	kInitialIntegrityCheckLength = 16   // Overhead.
 	kInitialMTU                  = 1252 // 1280 - UDP headers.
+	// When we send a ServerHello, assume that we need to send a few other things:
+	// long header, two maximum length CIDs, packet length and number,
+	// a STREAM frame header with offset and length, a PATH_CHALLENGE,
+	// and of course the AEAD expansion.
+	kServerHelloSpace = kInitialMTU - 2 - 18*2 - 2 - 4 - 5 - 9 - kInitialIntegrityCheckLength
 )
 
 // The protocol version number.
@@ -92,22 +97,6 @@ type ackRange struct {
 
 type ackRanges []ackRange
 
-type path struct {
-	remoteConnectionId ConnectionId
-	localConnectionId  ConnectionId
-	transport          Transport
-	congestion         CongestionController
-}
-
-func (p *path) String() string {
-	return fmt.Sprintf("%v_%v", p.localConnectionId, p.remoteConnectionId)
-}
-
-func (p *path) Send(pn uint64, packet []byte, ackOnly bool) error {
-	p.congestion.onPacketSent(pn, ackOnly, len(packet))
-	return p.transport.Send(packet)
-}
-
 /*
 Connection represents a QUIC connection. Clients can make
 connections directly but servers should create a minq.Server
@@ -132,13 +121,15 @@ type Connection struct {
 	currentPath        *path
 	paths              map[string]*path
 	transportFactory   TransportFactory
+	cidTable           *connectionTable
+	unusedLocalCids    []ConnectionId
+	unusedRemoteCids   []*newConnectionIdFrame
 	tls                *tlsConn
 	writeClear         *cryptoState
 	readClear          *cryptoState
 	writeProtected     *cryptoState
 	readProtected      *cryptoState
 	nextSendPacket     uint64
-	mtu                int
 	stream0            *stream
 	localBidiStreams   *streamSet
 	remoteBidiStreams  *streamSet
@@ -160,10 +151,11 @@ type Connection struct {
 	lastSendQueuedTime time.Time
 	closingEnd         time.Time
 	closePacket        []byte
+	newConnectionIdSeq uint16
 }
 
 // newConnection creates a new QUIC connection.
-func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls *TlsConfig, handler ConnectionHandler) *Connection {
+func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls *TlsConfig, cidTable *connectionTable, handler ConnectionHandler) *Connection {
 	transport, err := tf.MakeTransport(remoteAddr)
 	if err != nil {
 		return nil
@@ -172,8 +164,10 @@ func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls 
 		localConnectionId:  nil,
 		remoteConnectionId: nil,
 		transport:          transport,
+		remoteAddr:         remoteAddr,
 		congestion:         &CongestionControllerDummy{},
-		//congestion: newCongestionControllerIetf(c),
+		mtu:                kInitialMTU,
+		packetsAllowed:     ^uint(0),
 	}
 	c := &Connection{
 		handler:            handler,
@@ -183,13 +177,13 @@ func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls 
 		currentPath:        p,
 		paths:              map[string]*path{remoteAddr.String(): p},
 		transportFactory:   tf,
+		cidTable:           cidTable,
 		tls:                newTlsConn(tls, role),
 		writeClear:         nil,
 		readClear:          nil,
 		writeProtected:     nil,
 		readProtected:      nil,
 		nextSendPacket:     uint64(0),
-		mtu:                kInitialMTU,
 		stream0:            nil,
 		localBidiStreams:   newStreamSet(streamTypeBidirectionalLocal, role, 1),
 		remoteBidiStreams:  newStreamSet(streamTypeBidirectionalRemote, role, kConcurrentStreamsBidi),
@@ -215,36 +209,32 @@ func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls 
 
 	c.log = newConnectionLogger(c)
 
-	p.congestion.setLostPacketHandler(c.handleLostPacket)
-
+	cid, err := c.randomConnectionId(kCidDefaultLength)
+	if err != nil {
+		return nil
+	}
+	c.currentPath.localConnectionId = cid
+	var resetToken []byte
+	if c.cidTable != nil {
+		resetToken, err = c.cidTable.GenerateResetToken(cid)
+		if err != nil {
+			return nil
+		}
+		c.cidTable.Put(cid, remoteAddr, c)
+	}
 	// TODO(ekr@rtfm.com): This isn't generic, but rather tied to
 	// Mint.
-	c.tpHandler = newTransportParametersHandler(c.log, role, kQuicVersion)
+	c.tpHandler = newTransportParametersHandler(c.log, role, kQuicVersion, resetToken)
 	c.tls.setTransportParametersHandler(c.tpHandler)
 
+	//p.congestion: newCongestionControllerIetf(c),
+	p.congestion.setLostPacketHandler(c.handleLostPacket)
 	c.recvd = newRecvdPackets(c.log)
 
 	var clientStreams *streamSet
 	if role == RoleClient {
-		p.remoteConnectionId, err = c.randomConnectionId(8)
-		if err != nil {
-			return nil
-		}
-		p.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
-		if err != nil {
-			return nil
-		}
-		err = c.setupAeadMasking(p.remoteConnectionId)
-		if err != nil {
-			return nil
-		}
 		clientStreams = c.localBidiStreams
 	} else {
-		p.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
-		if err != nil {
-			return nil
-		}
-		c.setState(StateWaitClientInitial)
 		clientStreams = c.remoteBidiStreams
 	}
 	c.stream0 = newStream(c, 0, ^uint64(0), ^uint64(0)).(*stream)
@@ -254,17 +244,36 @@ func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls 
 	if err != nil {
 		return nil
 	}
-
 	return c
 }
 
 // NewConnection makes a new client connection.
 func NewConnection(tf TransportFactory, remoteAddr *net.UDPAddr, tls *TlsConfig, handler ConnectionHandler) *Connection {
-	return newConnection(tf, remoteAddr, RoleClient, tls, handler)
+	c := newConnection(tf, remoteAddr, RoleClient, tls, nil, handler)
+	if c == nil {
+		return nil
+	}
+	p := c.currentPath
+	var err error
+	p.remoteConnectionId, err = c.randomConnectionId(8)
+	if err != nil {
+		return nil
+	}
+	err = c.setupAeadMasking(p.remoteConnectionId)
+	if err != nil {
+		return nil
+	}
+
+	return c
 }
 
-func newServerConnection(tf TransportFactory, remoteAddr *net.UDPAddr, tls *TlsConfig) *Connection {
-	return newConnection(tf, remoteAddr, RoleServer, tls, nil)
+func newServerConnection(tf TransportFactory, remoteAddr *net.UDPAddr, tls *TlsConfig, cidTable *connectionTable) *Connection {
+	c := newConnection(tf, remoteAddr, RoleServer, tls, cidTable, nil)
+	if c == nil {
+		return nil
+	}
+	c.setState(StateWaitClientInitial)
+	return c
 }
 
 func (c *Connection) String() string {
@@ -305,6 +314,14 @@ func (c *Connection) setState(state State) {
 		c.handler.StateChanged(state)
 	}
 	c.state = state
+	if c.isClosed() && c.cidTable != nil {
+		for _, p := range c.paths {
+			c.cidTable.Remove(p.localConnectionId, p.remoteAddr)
+		}
+		for _, cid := range c.unusedLocalCids {
+			c.cidTable.RemoveCid(cid)
+		}
+	}
 }
 
 func (state State) String() string {
@@ -474,7 +491,7 @@ func (c *Connection) sendClientInitial() error {
 
 	c.setState(StateWaitServerFirstFlight)
 
-	_, err = c.sendPacket(packetTypeInitial, queued, nil, false)
+	_, err = c.sendPacket(packetTypeInitial, queued, c.currentPath, false)
 	return err
 }
 
@@ -504,7 +521,7 @@ func (c *Connection) determineAead(pt packetType) cipher.AEAD {
 
 func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint64, payload []byte, p *path, containsOnlyAcks bool) ([]byte, error) {
 	c.log(logTypeConnection, "Sending packet PT=%v PN=%x: %s", pt, pn, dumpPacket(payload))
-	left := c.mtu // track how much space is left for payload
+	left := p.mtu // track how much space is left for payload
 
 	aead := c.determineAead(pt)
 	left -= aead.Overhead()
@@ -537,7 +554,7 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 
 // Send a packet with whatever PT seems appropriate now.
 func (c *Connection) sendPacketNow(tosend []frame, containsOnlyAcks bool) ([]byte, error) {
-	return c.sendPacket(packetTypeProtectedShort, tosend, nil, containsOnlyAcks)
+	return c.sendPacket(packetTypeProtectedShort, tosend, c.currentPath, containsOnlyAcks)
 }
 
 // Send a packet with a specific PT.
@@ -663,7 +680,7 @@ func (c *Connection) sendCombinedPacket(pt packetType, frames []frame, acks ackR
 	// Record which packets we sent ACKs in.
 	c.sentAcks[c.nextSendPacket] = acks[0:asent]
 
-	_, err = c.sendPacket(pt, frames, nil, containsOnlyAcks)
+	_, err = c.sendPacket(pt, frames, c.currentPath, containsOnlyAcks)
 	if err != nil {
 		return 0, err
 	}
@@ -754,7 +771,7 @@ func (c *Connection) sendQueuedFrames(pt packetType, protected bool, bareAcks bo
 	frames := make([]frame, 0)
 	// Calculate available space in the next packet.
 	overhead := c.packetOverhead(c.currentPath, pt)
-	spaceInPacket := c.mtu - overhead
+	spaceInPacket := c.currentPath.mtu - overhead
 	spaceInCongestionWindow -= overhead
 
 	for i := range *queue {
@@ -795,7 +812,7 @@ func (c *Connection) sendQueuedFrames(pt packetType, protected bool, bareAcks bo
 
 			acks = acks[asent:]
 			frames = make([]frame, 0)
-			spaceInPacket = c.mtu - overhead
+			spaceInPacket = c.currentPath.mtu - overhead
 			spaceInCongestionWindow -= overhead
 		}
 
@@ -957,10 +974,6 @@ func (c *Connection) input(packet *UdpPacket) error {
 		if err != nil {
 			return err
 		}
-		c.currentPath.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
-		if err != nil {
-			return err
-		}
 		c.currentPath.remoteConnectionId = hdr.SourceConnectionID
 	}
 
@@ -1067,12 +1080,22 @@ func (c *Connection) getOrMakePath(remoteAddr *net.UDPAddr) (*path, error) {
 	if err != nil {
 		return nil, err
 	}
-	p = &path{
-		remoteConnectionId: nil, // TODO: get saved CID
-		localConnectionId:  nil, // TODO: get advertised CID and send NEW_CONNECTION_ID
-		transport:          t,
-		congestion:         &CongestionControllerDummy{},
+	if len(c.unusedLocalCids) == 0 || len(c.unusedRemoteCids) == 0 {
+		c.log(logTypeConnection, "can't open a path: no CID: local=%d remote=%d",
+			len(c.unusedLocalCids), len(c.unusedRemoteCids))
+		return nil, fatalError("no connection IDs")
 	}
+	p = &path{
+		remoteConnectionId: c.unusedRemoteCids[0].ConnectionId,
+		localConnectionId:  c.unusedLocalCids[0],
+		resetToken:         c.unusedRemoteCids[0].ResetToken[:],
+		transport:          t,
+		remoteAddr:         remoteAddr,
+		congestion:         &CongestionControllerDummy{},
+		packetsAllowed:     ^uint(0),
+	}
+	c.unusedRemoteCids = c.unusedRemoteCids[1:]
+	c.unusedLocalCids = c.unusedLocalCids[1:]
 	// TODO copy RTT information from the current path.
 	c.paths[remoteAddr.String()] = p
 	return p, nil
@@ -1151,22 +1174,30 @@ func (c *Connection) processClientInitial(hdr *packetHeader, payload []byte) err
 		if err != nil {
 			return err
 		}
-		_, err = c.sendPacketRaw(packetTypeRetry, kQuicVersion, hdr.PacketNumber, sf.encoded, nil, false)
+		_, err = c.sendPacketRaw(packetTypeRetry, kQuicVersion, hdr.PacketNumber, sf.encoded, c.currentPath, false)
 		return err
 	}
+
 	recv0 := c.stream0.recvStreamPrivate.(*recvStream)
 	recv0.fc.used = uint64(len(sf.Data))
 	recv0.readOffset = uint64(len(sf.Data))
 	c.setTransportParameters()
 
+	c.currentPath.packetsAllowed = 3
+	if len(sflt) > ((c.currentPath.mtu - kServerHelloSpace) * 3) {
+		challenge, err := c.currentPath.GeneratePathChallenge()
+		if err != nil {
+			return err
+		}
+		c.queueFrame(&c.outputClearQ, challenge)
+	}
 	err = c.sendOnStream0(sflt)
 	if err != nil {
 		return err
 	}
 
 	c.setState(StateWaitClientSecondFlight)
-
-	return err
+	return nil
 }
 
 func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, ackOnly *bool) error {
@@ -1260,6 +1291,15 @@ func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, ackOnly
 			if err != nil {
 				return err
 			}
+			// On the server, we need to set the path to verified.
+			switch c.tls.getHsState() {
+			case "Server START", "Server NEGOTIATED", "Server READ_PAST",
+				"Server WAIT_FLIGHT2":
+				// Still haven't seen anything concrete from the client.
+				// TODO: path validation using the TLS HRR cookie.
+			default:
+				c.currentPath.SetVerified()
+			}
 
 			if c.tls.finished {
 				err = c.handshakeComplete()
@@ -1301,7 +1341,7 @@ func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, ackOnly
 			c.queueFrame(&c.outputClearQ, newPathResponseFrame(inner.Data[:]))
 
 		case *pathResponseFrame:
-			return fatalError("we never send a PATH_CHALLENGE")
+			c.currentPath.VerifyPathResponse(inner.Data[:])
 
 		default:
 			c.log(logTypeConnection, "Received unexpected frame type")
@@ -1678,7 +1718,21 @@ func (c *Connection) processUnprotected(udp *UdpPacket, hdr *packetHeader, packe
 			isProbingFrame = true
 
 		case *pathResponseFrame:
-			return fatalError("we never send a PATH_CHALLENGE")
+			p := c.paths[udp.SrcAddr.String()]
+			if p != nil {
+				p.VerifyPathResponse(inner.Data[:])
+			}
+
+		case *newConnectionIdFrame:
+			if len(c.currentPath.remoteConnectionId) == 0 {
+				return ErrorInvalidEncoding
+			}
+			idx := int(inner.Sequence) - (len(c.paths) - 1)
+			if len(c.unusedRemoteCids) <= idx {
+				extra := make([]*newConnectionIdFrame, idx+1-len(c.unusedRemoteCids))
+				c.unusedRemoteCids = append(c.unusedRemoteCids, extra...)
+			}
+			c.unusedRemoteCids[idx] = inner
 
 		default:
 			c.log(logTypeConnection, "Received unexpected frame type")
@@ -1852,6 +1906,12 @@ func (c *Connection) setTransportParameters() {
 	c.sendFlowControl.update(uint64(c.tpHandler.peerParams.maxData))
 	c.localBidiStreams.nstreams = c.tpHandler.peerParams.maxStreamsBidi
 	c.localUniStreams.nstreams = c.tpHandler.peerParams.maxStreamsUni
+
+	if c.role == RoleClient {
+		if len(c.tpHandler.peerParams.resetToken) == 16 {
+			c.currentPath.resetToken = c.tpHandler.peerParams.resetToken
+		}
+	}
 }
 
 func (c *Connection) setupAeadMasking(cid ConnectionId) (err error) {
@@ -1903,6 +1963,8 @@ func (c *Connection) handshakeComplete() (err error) {
 		return
 	}
 	c.setState(StateEstablished)
+	c.currentPath.SetVerified()
+	c.sendNewConnectionId()
 
 	return nil
 }
@@ -1989,6 +2051,40 @@ func (c *Connection) randomConnectionId(size int) (ConnectionId, error) {
 	}
 
 	return ConnectionId(b), nil
+}
+
+func (c *Connection) sendNewConnectionId() error {
+	cid, err := c.randomConnectionId(kCidDefaultLength)
+	if err != nil {
+		return err
+	}
+
+	var token []byte
+	if c.cidTable != nil {
+		token, err = c.cidTable.GenerateResetToken(cid)
+		if err != nil {
+			return err
+		}
+		if !c.cidTable.PutCid(cid, c) {
+			return fatalError("connection ID collision")
+		}
+	} else {
+		// We won't generate this, but we need to send something,
+		// and all zero values could be exploited.
+		token = make([]byte, 16)
+		_, err = io.ReadFull(rand.Reader, token)
+		if err != nil {
+			return err
+		}
+	}
+
+	c.unusedLocalCids = append(c.unusedLocalCids, cid)
+
+	ncid := newNewConnectionIdFrame(c.newConnectionIdSeq, cid, token)
+	c.log(logTypeConnection, "generate new connection ID: %v", ncid)
+	c.newConnectionIdSeq++
+	c.queueFrame(&c.outputProtectedQ, ncid)
+	return nil
 }
 
 func (c *Connection) randomPacketNumber() error {

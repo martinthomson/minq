@@ -377,7 +377,7 @@ func newStreamIdBlockedFrame(id uint64) frame {
 type newConnectionIdFrame struct {
 	Type         frameType
 	Sequence     uint16 `tls:"varint"`
-	ConnectionId uint64
+	ConnectionId []byte `tls:"head=1"`
 	ResetToken   [16]byte
 }
 
@@ -387,6 +387,17 @@ func (f newConnectionIdFrame) String() string {
 
 func (f newConnectionIdFrame) getType() frameType {
 	return kFrameTypeNewConnectionId
+}
+
+func newNewConnectionIdFrame(seq uint16, cid ConnectionId, resetToken []byte) frame {
+	f := &newConnectionIdFrame{
+		Type:         kFrameTypeNewConnectionId,
+		Sequence:     seq,
+		ConnectionId: cid,
+	}
+	assert(len(resetToken) == len(f.ResetToken))
+	copy(f.ResetToken[:], resetToken)
+	return newFrame(0, f)
 }
 
 // ACK

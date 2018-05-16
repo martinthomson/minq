@@ -166,7 +166,7 @@ func newCsPair(t *testing.T) *csPair {
 	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
-	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig())
+	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	return &csPair{
@@ -204,7 +204,7 @@ func TestSendReceiveCIOnly(t *testing.T) {
 	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
-	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig())
+	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	err := client.sendClientInitial()
@@ -221,7 +221,7 @@ func TestSendReceiveDupCI(t *testing.T) {
 	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
-	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig())
+	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	err := client.sendClientInitial()
@@ -244,7 +244,7 @@ func TestSendReceiveCISI(t *testing.T) {
 	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
-	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig())
+	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	err := client.sendClientInitial()
@@ -558,7 +558,7 @@ func TestVersionNegotiationPacket(t *testing.T) {
 	// Set the client version to something bogus.
 	client.version = kQuicGreaseVersion2
 
-	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig())
+	server := newServerConnection(sTrans, dummyAddr2, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	err := client.sendClientInitial()
@@ -603,7 +603,7 @@ func TestStatelessRetry(t *testing.T) {
 	hrrConfig := *testTlsConfig()
 	hrrConfig.ForceHrr = true
 
-	server := newServerConnection(sTrans, dummyAddr2, &hrrConfig)
+	server := newServerConnection(sTrans, dummyAddr2, &hrrConfig, nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	err := client.sendClientInitial()
@@ -641,7 +641,7 @@ func TestSessionResumption(t *testing.T) {
 	assertNotNil(t, client, "Couldn't make client")
 
 	sconf := testTlsConfig()
-	server := newServerConnection(sTrans, dummyAddr2, sconf)
+	server := newServerConnection(sTrans, dummyAddr2, sconf, nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	pair := csPair{client, server}
@@ -688,7 +688,7 @@ func TestUnidirectionalStream(t *testing.T) {
 	assertNotNil(t, client, "Couldn't make client")
 
 	sconf := testTlsConfig()
-	server := newServerConnection(sTrans, dummyAddr2, sconf)
+	server := newServerConnection(sTrans, dummyAddr2, sconf, nil)
 	var catcher streamCatcher
 	server.SetHandler(&catcher)
 	assertNotNil(t, server, "Couldn't make server")
@@ -737,7 +737,7 @@ func TestUnidirectionalStreamRst(t *testing.T) {
 	assertNotNil(t, client, "Couldn't make client")
 
 	sconf := testTlsConfig()
-	server := newServerConnection(sTrans, dummyAddr2, sconf)
+	server := newServerConnection(sTrans, dummyAddr2, sconf, nil)
 	assertNotNil(t, server, "Couldn't make server")
 
 	pair := csPair{client, server}

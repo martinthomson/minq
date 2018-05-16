@@ -2,7 +2,6 @@ package minq
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 
@@ -59,6 +58,7 @@ type transportParameters struct {
 	maxStreamsUni  int
 	idleTimeout    uint16
 	ackDelayExp    uint8
+	resetToken     []byte
 }
 
 type TransportParameterList []transportParameter
@@ -174,11 +174,12 @@ type transportParametersHandler struct {
 	log        loggingFunction
 	role       Role
 	version    VersionNumber
+	resetToken []byte
 	peerParams *transportParameters
 }
 
-func newTransportParametersHandler(log loggingFunction, role Role, version VersionNumber) *transportParametersHandler {
-	return &transportParametersHandler{log, role, version, nil}
+func newTransportParametersHandler(log loggingFunction, role Role, version VersionNumber, resetToken []byte) *transportParametersHandler {
+	return &transportParametersHandler{log, role, version, resetToken, nil}
 }
 
 func (h *transportParametersHandler) Send(hs mint.HandshakeType, el *mint.ExtensionList) error {
@@ -326,6 +327,13 @@ func (h *transportParametersHandler) Receive(hs mint.HandshakeType, el *mint.Ext
 	}
 	tp.ackDelayExp = uint8(tmp)
 
+	b := params.getParameter(kTpIdStatelessResetToken)
+	if len(b) == 16 {
+		tp.resetToken = b
+	} else if len(b) != 0 {
+		return ErrorInvalidEncoding
+	}
+
 	h.peerParams = &tp
 
 	return nil
@@ -363,15 +371,11 @@ func (h *transportParametersHandler) createEncryptedExtensionsTransportParameter
 		return nil, err
 	}
 
-	b := make([]byte, 16)
-	_, err = rand.Read(b)
-	if err != nil {
-		return nil, err
+	if h.resetToken != nil {
+		eetp.Parameters.addOpaqueParameter(kTpIdStatelessResetToken, h.resetToken)
 	}
 
-	eetp.Parameters.addOpaqueParameter(kTpIdStatelessResetToken, b)
-
-	b, err = syntax.Marshal(eetp)
+	b, err := syntax.Marshal(eetp)
 	if err != nil {
 		return nil, err
 	}

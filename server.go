@@ -1,5 +1,94 @@
 package minq
 
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"hash"
+	"io"
+	"net"
+)
+
+type connectionTable struct {
+	idTable        map[string]*Connection
+	addrTable      map[string]*Connection
+	resetTokenHmac hash.Hash
+}
+
+func (ct *connectionTable) Put(cid ConnectionId, remoteAddr *net.UDPAddr, c *Connection) bool {
+	if !ct.PutCid(cid, c) {
+		return false
+	}
+	ct.PutRemoteAddr(remoteAddr, c)
+	return true
+}
+
+func (ct *connectionTable) PutCid(cid ConnectionId, c *Connection) bool {
+	_, present := ct.idTable[cid.String()]
+	if present {
+		// The connection ID has to be unique.
+		return false
+	}
+	ct.idTable[cid.String()] = c
+	return true
+}
+
+// Address is not guaranteed unique, if there is a collision, then any existing entry
+// is removed to avoid confusion.
+func (ct *connectionTable) PutRemoteAddr(remoteAddr *net.UDPAddr, c *Connection) {
+	_, present := ct.addrTable[remoteAddr.String()]
+	if present {
+		delete(ct.addrTable, remoteAddr.String())
+	} else {
+		// The remote address is a fallback.
+		ct.addrTable[remoteAddr.String()] = c
+	}
+}
+
+func (ct *connectionTable) Get(cid ConnectionId) *Connection {
+	return ct.idTable[cid.String()]
+}
+
+func (ct *connectionTable) GetAddr(remoteAddr *net.UDPAddr) *Connection {
+	return ct.addrTable[remoteAddr.String()]
+}
+
+func (ct *connectionTable) Count() int {
+	return len(ct.idTable)
+}
+
+func (ct *connectionTable) Remove(cid ConnectionId, remoteAddr *net.UDPAddr) {
+	ct.RemoveCid(cid)
+	delete(ct.addrTable, remoteAddr.String())
+}
+
+func (ct *connectionTable) RemoveCid(cid ConnectionId) {
+	delete(ct.idTable, cid.String())
+}
+
+func (ct *connectionTable) GenerateResetToken(cid ConnectionId) ([]byte, error) {
+	if ct.resetTokenHmac == nil {
+		k := make([]byte, 16)
+		_, err := io.ReadFull(rand.Reader, k)
+		if err != nil {
+			return nil, err
+		}
+		ct.resetTokenHmac = hmac.New(sha256.New, k)
+	}
+	return ct.resetTokenHmac.Sum([]byte(cid))[0:16], nil
+}
+
+// All runs the provided function on all connections.  This exits early on error.
+func (t *connectionTable) All(f func(*Connection) error) error {
+	for _, c := range t.idTable {
+		err := f(c)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Server represents a QUIC server. A server can be fed an arbitrary
 // number of packets and will create Connections as needed, passing
 // each packet to the right connection.
@@ -7,8 +96,7 @@ type Server struct {
 	handler      ServerHandler
 	transFactory TransportFactory
 	tls          *TlsConfig
-	addrTable    map[string]*Connection
-	idTable      map[string]*Connection
+	connectionTable
 }
 
 // Interface for the handler object which the Server will call
@@ -40,7 +128,7 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 	if len(hdr.DestinationConnectionID) > 0 {
 		logf(logTypeServer, "Received conn id %v", hdr.DestinationConnectionID)
-		conn = s.idTable[hdr.DestinationConnectionID.String()]
+		conn = s.Get(hdr.DestinationConnectionID)
 		if conn != nil {
 			logf(logTypeServer, "Found by conn id")
 		}
@@ -52,7 +140,7 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 	if conn == nil {
 		logf(logTypeServer, "New server connection from addr %v", addr)
-		conn = newServerConnection(s.transFactory, addr, s.tls)
+		conn = newServerConnection(s.transFactory, addr, s.tls, &s.connectionTable)
 		if conn == nil {
 			return nil, fatalError("unable to create server")
 		}
@@ -73,7 +161,6 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 		// TODO: have server connections manage their own entries in the table so
 		// that they can use NEW_CONNECTION_ID and connection migration.
-		s.idTable[conn.ServerId().String()] = conn
 		s.addrTable[addr.String()] = conn
 		if s.handler != nil {
 			s.handler.NewConnection(conn)
@@ -85,30 +172,31 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 // Check the server timers.
 func (s *Server) CheckTimer() error {
-	for _, conn := range s.idTable {
+	return s.connectionTable.All(func(conn *Connection) error {
 		_, err := conn.CheckTimer()
 		if isFatalError(err) {
 			logf(logTypeServer, "Fatal Error %v killing connection %v", err, conn)
-			delete(s.idTable, conn.ServerId().String())
-			// TODO(ekr@rtfm.com): Delete this from the addr table.
+			return err
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // How many connections do we have?
 func (s *Server) ConnectionCount() int {
-	return len(s.idTable)
+	return s.connectionTable.Count()
 }
 
 // Create a new QUIC server with the provide TLS config.
 func NewServer(factory TransportFactory, tls *TlsConfig, handler ServerHandler) *Server {
 	s := Server{
-		handler,
-		factory,
-		tls,
-		make(map[string]*Connection),
-		make(map[string]*Connection),
+		handler:      handler,
+		transFactory: factory,
+		tls:          tls,
+		connectionTable: connectionTable{
+			idTable:   make(map[string]*Connection),
+			addrTable: make(map[string]*Connection),
+		},
 	}
 	s.tls.init()
 	return &s
