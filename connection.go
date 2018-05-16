@@ -1080,9 +1080,13 @@ func (c *Connection) getOrMakePath(remoteAddr *net.UDPAddr) (*path, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(c.unusedLocalCids) == 0 || len(c.unusedRemoteCids) == 0 {
-		c.log(logTypeConnection, "can't open a path: no CID: local=%d remote=%d",
-			len(c.unusedLocalCids), len(c.unusedRemoteCids))
+	err = c.sendNewConnectionId()
+	if err != nil {
+		return nil, err
+	}
+	if len(c.unusedRemoteCids) == 0 || c.unusedRemoteCids[0] == nil {
+		c.log(logTypeConnection, "can't open a path: no remote CID, %d available",
+			len(c.unusedRemoteCids))
 		return nil, fatalError("no connection IDs")
 	}
 	p = &path{

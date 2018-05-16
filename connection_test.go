@@ -74,7 +74,12 @@ type testTransportFactory struct {
 }
 
 func (tf *testTransportFactory) MakeTransport(*net.UDPAddr) (Transport, error) {
-	return tf.t, nil
+	t := tf.t
+	if t != nil {
+		tf.t = nil
+		return t, nil
+	}
+	return nil, internalError("test transport factory was exhausted")
 }
 
 func (tf *testTransportFactory) newPairedTransport(autoFlush bool) *testTransportFactory {

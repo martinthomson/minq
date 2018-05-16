@@ -9,6 +9,9 @@ import (
 	"net"
 )
 
+// The number of octets we can receive before we sent a stateless reset.
+const kStatelessResetMinimum = 40
+
 type connectionTable struct {
 	idTable        map[string]*Connection
 	addrTable      map[string]*Connection
@@ -139,6 +142,17 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 	}
 
 	if conn == nil {
+		if !hdr.Type.isLongHeader() {
+			logf(logTypeServer, "Short header packet for unknown connection")
+			if len(data) >= kStatelessResetMinimum {
+				err = s.sendStatelessReset(hdr.DestinationConnectionID, addr)
+				if err != nil {
+					logf(logTypeServer, "error sending stateless reset")
+				}
+			}
+			return nil, fatalError("stateless reset sent")
+		}
+
 		logf(logTypeServer, "New server connection from addr %v", addr)
 		conn = newServerConnection(s.transFactory, addr, s.tls, &s.connectionTable)
 		if conn == nil {
@@ -168,6 +182,31 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 	}
 
 	return conn, nil
+}
+
+func (s *Server) sendStatelessReset(cid ConnectionId, remoteAddr *net.UDPAddr) error {
+	token, err := s.GenerateResetToken(cid)
+	if err != nil {
+		return err
+	}
+	sr := make([]byte, 21)
+	_, err = io.ReadFull(rand.Reader, sr)
+	if err != nil {
+		return err
+	}
+	extra := make([]byte, int(sr[0]&0xf))
+	_, err = io.ReadFull(rand.Reader, extra)
+	if err != nil {
+		return err
+	}
+	sr[0] = 0x43
+	sr = append(sr, append(extra, token...)...)
+
+	t, err := s.transFactory.MakeTransport(remoteAddr)
+	if err != nil {
+		return err
+	}
+	return t.Send(sr)
 }
 
 // Check the server timers.
