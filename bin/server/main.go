@@ -370,7 +370,12 @@ func main() {
 			}
 			b = b[:n]
 
-			_, err = server.Input(addr, b)
+			p := &minq.UdpPacket{
+				DestAddr: uaddr,
+				SrcAddr:  addr,
+				Data:     b,
+			}
+			_, err = server.Input(p)
 			if err != nil {
 				log.Println("server.Input returned error: ", err)
 				return

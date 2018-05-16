@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"time"
 
 	"github.com/bifurcation/mint"
@@ -436,7 +437,7 @@ func (c *Connection) sendClientInitial() error {
 
 	c.setState(StateWaitServerFirstFlight)
 
-	_, err = c.sendPacket(packetTypeInitial, queued, false)
+	_, err = c.sendPacket(packetTypeInitial, queued, nil, false)
 	return err
 }
 
@@ -464,7 +465,7 @@ func (c *Connection) determineAead(pt packetType) cipher.AEAD {
 	return aead
 }
 
-func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint64, payload []byte, containsOnlyAcks bool) ([]byte, error) {
+func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint64, payload []byte, remoteAddr *net.UDPAddr, containsOnlyAcks bool) ([]byte, error) {
 	c.log(logTypeConnection, "Sending packet PT=%v PN=%x: %s", pt, pn, dumpPacket(payload))
 	left := c.mtu // track how much space is left for payload
 
@@ -499,18 +500,18 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 
 	c.log(logTypeTrace, "Sending packet len=%d, len=%v", len(packet), hex.EncodeToString(packet))
 	c.congestion.onPacketSent(pn, containsOnlyAcks, len(packet)) //TODO(piet@devae.re) check isackonly
-	c.transport.Send(packet)
+	c.transport.SendTo(packet, remoteAddr)
 
 	return packet, nil
 }
 
 // Send a packet with whatever PT seems appropriate now.
 func (c *Connection) sendPacketNow(tosend []frame, containsOnlyAcks bool) ([]byte, error) {
-	return c.sendPacket(packetTypeProtectedShort, tosend, containsOnlyAcks)
+	return c.sendPacket(packetTypeProtectedShort, tosend, nil, containsOnlyAcks)
 }
 
 // Send a packet with a specific PT.
-func (c *Connection) sendPacket(pt packetType, tosend []frame, containsOnlyAcks bool) ([]byte, error) {
+func (c *Connection) sendPacket(pt packetType, tosend []frame, remoteAddr *net.UDPAddr, containsOnlyAcks bool) ([]byte, error) {
 	sent := 0
 
 	payload := make([]byte, 0)
@@ -523,13 +524,6 @@ func (c *Connection) sendPacket(pt packetType, tosend []frame, containsOnlyAcks 
 
 		c.log(logTypeTrace, "Frame=%v", hex.EncodeToString(f.encoded))
 
-		{
-			msd, ok := f.f.(*maxStreamDataFrame)
-			if ok {
-				c.log(logTypeFlowControl, "EKR: PT=%x Sending maxStreamDate %v %v", c.nextSendPacket, msd.StreamId, msd.MaximumStreamData)
-			}
-
-		}
 		payload = append(payload, f.encoded...)
 		sent++
 	}
@@ -537,7 +531,7 @@ func (c *Connection) sendPacket(pt packetType, tosend []frame, containsOnlyAcks 
 	pn := c.nextSendPacket
 	c.nextSendPacket++
 
-	return c.sendPacketRaw(pt, c.version, pn, payload, containsOnlyAcks)
+	return c.sendPacketRaw(pt, c.version, pn, payload, remoteAddr, containsOnlyAcks)
 }
 
 // sendOnStream0 is used prior to the handshake completing.  Stream 0 is exempt
@@ -639,7 +633,7 @@ func (c *Connection) sendCombinedPacket(pt packetType, frames []frame, acks ackR
 	// Record which packets we sent ACKs in.
 	c.sentAcks[c.nextSendPacket] = acks[0:asent]
 
-	_, err = c.sendPacket(pt, frames, containsOnlyAcks)
+	_, err = c.sendPacket(pt, frames, nil, containsOnlyAcks)
 	if err != nil {
 		return 0, err
 	}
@@ -863,7 +857,7 @@ func (c *Connection) outstandingQueuedBytes() (n int) {
 // Input provides a packet to the connection.
 //
 // TODO(ekr@rtfm.com): when is error returned?
-func (c *Connection) Input(p []byte) error {
+func (c *Connection) Input(p *UdpPacket) error {
 	return c.handleError(c.input(p))
 }
 
@@ -879,7 +873,7 @@ func (c *Connection) fireReadable() {
 	})
 }
 
-func (c *Connection) input(p []byte) error {
+func (c *Connection) input(packet *UdpPacket) error {
 	if c.isClosed() {
 		return ErrorConnIsClosed
 	}
@@ -887,7 +881,7 @@ func (c *Connection) input(p []byte) error {
 	if c.state == StateClosing {
 		c.log(logTypeConnection, "Discarding packet while closing (closePacket=%v)", c.closePacket != nil)
 		if c.closePacket != nil {
-			c.transport.Send(c.closePacket)
+			c.transport.SendTo(c.closePacket, nil)
 		}
 		return ErrorConnIsClosing
 	}
@@ -895,6 +889,7 @@ func (c *Connection) input(p []byte) error {
 	c.lastInput = time.Now()
 
 	hdr := packetHeader{shortCidLength: kCidDefaultLength}
+	p := packet.Data
 
 	c.log(logTypeTrace, "Receiving packet len=%v %v", len(p), hex.EncodeToString(p))
 	hdrlen, err := decode(&hdr, p)
@@ -994,22 +989,28 @@ func (c *Connection) input(p []byte) error {
 	// We have now verified that this is a valid packet, so mark
 	// it received.
 	c.logPacket("Received", &hdr, packetNumber, payload)
-
-	naf := true
+	probing := false
+	ackOnly := true
 	switch typ {
 	case packetTypeInitial:
 		err = c.processClientInitial(&hdr, payload)
 	case packetTypeHandshake:
-		err = c.processCleartext(&hdr, payload, &naf)
+		err = c.processCleartext(&hdr, payload, &ackOnly)
 	case packetTypeProtectedShort:
-		err = c.processUnprotected(&hdr, packetNumber, payload, &naf)
+		err = c.processUnprotected(packet, &hdr, packetNumber, payload, &ackOnly, &probing)
 	default:
 		c.log(logTypeConnection, "Unsupported packet type %v", typ)
 		err = internalError("Unsupported packet type %v", typ)
 	}
-	c.recvd.packetSetReceived(packetNumber, hdr.Type.isProtected(), naf)
 	if err != nil {
 		return err
+	}
+	c.recvd.packetSetReceived(packetNumber, hdr.Type.isProtected(), ackOnly)
+	if packetNumber > c.recvd.maxReceived && !probing {
+		err = c.migrate(packet.SrcAddr)
+		if err != nil {
+			return err
+		}
 	}
 
 	lastSendQueuedTime := c.lastSendQueuedTime
@@ -1032,6 +1033,15 @@ func (c *Connection) input(p []byte) error {
 	}
 
 	return err
+}
+
+func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
+	err := c.transport.SetRemoteAddr(remoteAddr)
+	if err != nil {
+		return err
+	}
+	c.congestion.reset()
+	return nil
 }
 
 func (c *Connection) processClientInitial(hdr *packetHeader, payload []byte) error {
@@ -1097,7 +1107,7 @@ func (c *Connection) processClientInitial(hdr *packetHeader, payload []byte) err
 		if err != nil {
 			return err
 		}
-		_, err = c.sendPacketRaw(packetTypeRetry, kQuicVersion, hdr.PacketNumber, sf.encoded, false)
+		_, err = c.sendPacketRaw(packetTypeRetry, kQuicVersion, hdr.PacketNumber, sf.encoded, nil, false)
 		return err
 	}
 	recv0 := c.stream0.recvStreamPrivate.(*recvStream)
@@ -1115,8 +1125,8 @@ func (c *Connection) processClientInitial(hdr *packetHeader, payload []byte) err
 	return err
 }
 
-func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, naf *bool) error {
-	*naf = false
+func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, ackOnly *bool) error {
+	*ackOnly = true
 	c.log(logTypeHandshake, "Reading cleartext in state %v", c.state)
 	// TODO(ekr@rtfm.com): Need clearer state checks.
 	/*
@@ -1137,7 +1147,7 @@ func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, naf *bo
 		c.log(logTypeHandshake, "Frame type %v", f.f.getType())
 
 		payload = payload[n:]
-		nonAck := true
+		isAckFrame := false
 		switch inner := f.f.(type) {
 		case *paddingFrame:
 			// Skip.
@@ -1233,19 +1243,28 @@ func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, naf *bo
 			if err != nil {
 				return err
 			}
-			nonAck = false
+			isAckFrame = true
 
 		case *connectionCloseFrame:
 			c.log(logTypeConnection, "Received frame close")
 			c.setState(StateClosed)
 			return fatalError("Connection closed")
 
+		case *pathChallengeFrame:
+			// During the handshake, just put PATH_RESPONSE on the same queue as
+			// all other packets.  Assume that our address hasn't changed.
+			c.log(logTypeConnection, "Received path challenge")
+			c.queueFrame(&c.outputClearQ, newPathResponseFrame(inner.Data[:]))
+
+		case *pathResponseFrame:
+			return fatalError("we never send a PATH_CHALLENGE")
+
 		default:
 			c.log(logTypeConnection, "Received unexpected frame type")
 			return fatalError("Unexpected frame type: %v", f.f.getType())
 		}
-		if nonAck {
-			*naf = true
+		if !isAckFrame {
+			*ackOnly = false
 		}
 	}
 
@@ -1286,7 +1305,7 @@ func (c *Connection) sendVersionNegotiation(hdr packetHeader) error {
 	// Note that we do not update the congestion controller for this packet.
 	// This connection is about to disappear anyway.  Our defense against being
 	// used as an amplifier is the size check above.
-	c.transport.Send(packet)
+	c.transport.SendTo(packet, nil)
 	return nil
 }
 
@@ -1463,10 +1482,14 @@ func (c *Connection) issueStreamIdCredit(t streamType) {
 	c.log(logTypeFlowControl, "Issuing more %v stream ID credit: %d", t, max)
 }
 
-func (c *Connection) processUnprotected(hdr *packetHeader, packetNumber uint64, payload []byte, naf *bool) error {
+// Processes a short header packet contents.
+func (c *Connection) processUnprotected(udp *UdpPacket, hdr *packetHeader, packetNumber uint64, payload []byte, ackOnly *bool, probing *bool) error {
 	c.log(logTypeHandshake, "Reading unprotected data in state %v", c.state)
 	c.log(logTypeConnection, "Received Packet=%v", dumpPacket(payload))
-	*naf = false
+
+	*ackOnly = true
+	*probing = true
+
 	for len(payload) > 0 {
 		c.log(logTypeConnection, "payload bytes left %d", len(payload))
 		n, f, err := decodeFrame(payload)
@@ -1477,9 +1500,12 @@ func (c *Connection) processUnprotected(hdr *packetHeader, packetNumber uint64, 
 		c.log(logTypeConnection, "Frame type %v", f.f.getType())
 
 		payload = payload[n:]
-		nonAck := true
+		isAckFrame := false
+		isProbingFrame := false
+
 		switch inner := f.f.(type) {
 		case *paddingFrame:
+			isProbingFrame = true
 			// Skip.
 		case *rstStreamFrame:
 			// TODO(ekr@rtfm.com): Don't let the other side initiate
@@ -1564,7 +1590,7 @@ func (c *Connection) processUnprotected(hdr *packetHeader, packetNumber uint64, 
 			if err != nil {
 				return err
 			}
-			nonAck = false
+			isAckFrame = true
 
 		case *streamFrame:
 			c.log(logTypeStream, "Received on stream %v", inner)
@@ -1590,11 +1616,27 @@ func (c *Connection) processUnprotected(hdr *packetHeader, packetNumber uint64, 
 				}
 			}
 
+		case *pathChallengeFrame:
+			// If we receive a PATH_CHALLENGE, the response needs to go back
+			// to the same remote address.  That means sending a packet directly.
+			c.log(logTypeConnection, "Received path challenge")
+			// TODO use new connection ID here
+			frames := []frame{newPathResponseFrame(inner.Data[:])}
+			_, err = c.sendPacket(packetTypeProtectedShort, frames, udp.SrcAddr, false)
+
+			isProbingFrame = true
+
+		case *pathResponseFrame:
+			return fatalError("we never send a PATH_CHALLENGE")
+
 		default:
 			c.log(logTypeConnection, "Received unexpected frame type")
 		}
-		if nonAck {
-			*naf = true
+		if !isProbingFrame {
+			*probing = false
+		}
+		if !isAckFrame {
+			*ackOnly = false
 		}
 	}
 

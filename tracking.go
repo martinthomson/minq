@@ -9,7 +9,7 @@ import (
 
 type packetData struct {
 	protected bool
-	nonAcks   bool
+	ackOnly   bool
 	pn        uint64
 	t         time.Time
 	acked2    bool
@@ -55,7 +55,7 @@ func (p *recvdPackets) packetNotReceived(pn uint64) bool {
 	return !found
 }
 
-func (p *recvdPackets) packetSetReceived(pn uint64, protected bool, nonAcks bool) {
+func (p *recvdPackets) packetSetReceived(pn uint64, protected bool, ackOnly bool) {
 	if pn > p.maxReceived {
 		p.maxReceived = pn
 	}
@@ -65,7 +65,7 @@ func (p *recvdPackets) packetSetReceived(pn uint64, protected bool, nonAcks bool
 	p.log(logTypeAck, "Setting packet received=%x", pn)
 	p.packets[pn] = &packetData{
 		protected,
-		nonAcks,
+		ackOnly,
 		pn,
 		time.Now(),
 		false,
@@ -131,7 +131,7 @@ func (p *recvdPackets) prepareAckRange(protected bool, allowAckOnly bool) ackRan
 		if needs_ack {
 			p.log(logTypeTrace, "Acking packet %x", pn)
 		}
-		if needs_ack && pk.nonAcks {
+		if needs_ack && !pk.ackOnly {
 			// Note if this is an ack of anything other than
 			// acks.
 			p.log(logTypeTrace, "Packet %x contains non-acks", pn)

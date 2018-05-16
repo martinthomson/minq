@@ -10,16 +10,23 @@ type UdpTransport struct {
 	r *net.UDPAddr
 }
 
-func (t *UdpTransport) Send(p []byte) error {
+func (t *UdpTransport) SendTo(p []byte, r *net.UDPAddr) error {
+	if r == nil {
+		r = t.r
+	}
 	logf(logTypeUdp, "Sending message of len %v", len(p))
-	n, err := t.u.WriteToUDP(p, t.r)
+	n, err := t.u.WriteToUDP(p, r)
 	if err != nil {
 		return err
 	}
 	if n != len(p) {
 		return fmt.Errorf("Incomplete write")
 	}
+	return nil
+}
 
+func (t *UdpTransport) SetRemoteAddr(r *net.UDPAddr) error {
+	t.r = r
 	return nil
 }
 

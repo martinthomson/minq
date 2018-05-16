@@ -33,7 +33,7 @@ func serverInputAll(t *testing.T, trans *testTransport, s *Server, u net.UDPAddr
 			return clast, nil
 		}
 
-		c, err := s.Input(&u, p)
+		c, err := s.Input(&UdpPacket{DestAddr: &u, SrcAddr: &u, Data: p})
 		if err != nil {
 			return nil, err
 		}

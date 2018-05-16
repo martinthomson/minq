@@ -24,11 +24,11 @@ func (h *connHandler) NewStream(s *minq.Stream) {
 func (h *connHandler) StreamReadable(s *minq.Stream) {
 }
 
-func readUDP(s *net.UDPConn) ([]byte, error) {
+func readUDP(s *net.UDPConn, local *net.UDPAddr) (*minq.UdpPacket, error) {
 	b := make([]byte, 8192)
 
 	s.SetReadDeadline(time.Now().Add(time.Second))
-	n, _, err := s.ReadFromUDP(b)
+	n, addr, err := s.ReadFromUDP(b)
 	if err != nil {
 		e, o := err.(net.Error)
 		if o && e.Timeout() {
@@ -42,8 +42,11 @@ func readUDP(s *net.UDPConn) ([]byte, error) {
 		fmt.Println("Underread from UDP socket")
 		return nil, err
 	}
-	b = b[:n]
-	return b, nil
+	return &minq.UdpPacket{
+		DestAddr: local,
+		SrcAddr:  addr,
+		Data:     b[:n],
+	}, nil
 }
 
 func main() {
@@ -83,7 +86,7 @@ func main() {
 	_, err = conn.CheckTimer()
 
 	for conn.GetState() != minq.StateEstablished {
-		b, err := readUDP(usock)
+		b, err := readUDP(usock, uaddr)
 		if err != nil {
 			if err == minq.ErrorWouldBlock {
 				_, err = conn.CheckTimer()

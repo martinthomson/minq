@@ -14,9 +14,9 @@ import (
 // congestion control related constants
 const (
 	kDefaultMss          = 1460 // bytes
-	kInitalWindow        = 10 * kDefaultMss
+	kInitialWindow       = 10 * kDefaultMss
 	kMinimumWindow       = 2 * kDefaultMss
-	kMaximumWindow       = kInitalWindow
+	kMaximumWindow       = kInitialWindow
 	kLossReductionFactor = 0.5
 )
 
@@ -37,6 +37,7 @@ type CongestionController interface {
 	bytesAllowedToSend() int
 	setLostPacketHandler(handler func(pn uint64))
 	rto() time.Duration
+	reset()
 }
 
 /*
@@ -64,10 +65,11 @@ func (cc *CongestionControllerDummy) rto() time.Duration {
 	return kMinRTOTimeout
 }
 
-/*
- * draft-ietf-quic-recovery congestion controller
- */
+func (cc *CongestionControllerDummy) reset() {
+}
 
+// CongestionControllerIetf implements the congestion control algorithm
+// defined in draft-ietf-quic-recovery.
 type CongestionControllerIetf struct {
 	// Congestion control related
 	bytesInFlight    int
@@ -308,10 +310,28 @@ func (cc *CongestionControllerIetf) bytesAllowedToSend() int {
 	return cc.congestionWindow - cc.bytesInFlight
 }
 
+func (cc *CongestionControllerIetf) reset() {
+	cc.bytesInFlight = 0
+	cc.congestionWindow = kInitialWindow
+	cc.endOfRecovery = 0
+	cc.sstresh = int(^uint(0) >> 1)
+	cc.lossDetectionAlarm = 0
+	cc.handshakeCount = 0
+	cc.tlpCount = 0
+	cc.rtoCount = 0
+	cc.largestSendBeforeRto = 0
+	cc.timeOfLastSentPacket = time.Unix(0, 0)
+	cc.largestSendPacket = 0
+	cc.largestAckedPacket = 0
+	cc.minRtt = 100 * time.Second
+	// keep RTT estimates
+	// keep configuration
+}
+
 func newCongestionControllerIetf(conn *Connection) *CongestionControllerIetf {
 	return &CongestionControllerIetf{
 		0,                            // bytesInFlight
-		kInitalWindow,                // congestionWindow
+		kInitialWindow,               // congestionWindow
 		0,                            // endOfRecovery
 		int(^uint(0) >> 1),           // sstresh
 		0,                            // lossDetectionAlarm

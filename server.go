@@ -1,16 +1,5 @@
 package minq
 
-import (
-	"net"
-)
-
-// TransportFactory makes transports bound to a specific remote
-// address.
-type TransportFactory interface {
-	// Make a transport object bound to |remote|.
-	MakeTransport(remote *net.UDPAddr) (Transport, error)
-}
-
 // Server represents a QUIC server. A server can be fed an arbitrary
 // number of packets and will create Connections as needed, passing
 // each packet to the right connection.
@@ -35,11 +24,13 @@ func (s *Server) SetHandler(h ServerHandler) {
 }
 
 // Input passes an incoming packet to the Server.
-func (s *Server) Input(addr *net.UDPAddr, data []byte) (*Connection, error) {
+func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
+	addr := packet.SrcAddr
 	logf(logTypeServer, "Received packet from %v", addr)
 	hdr := packetHeader{shortCidLength: kCidDefaultLength}
 	newConn := false
 
+	data := packet.Data
 	_, err := decode(&hdr, data)
 	if err != nil {
 		return nil, err
@@ -69,7 +60,7 @@ func (s *Server) Input(addr *net.UDPAddr, data []byte) (*Connection, error) {
 		newConn = true
 	}
 
-	err = conn.Input(data)
+	err = conn.Input(packet)
 	if isFatalError(err) {
 		logf(logTypeServer, "Fatal Error %v killing connection %v", err, conn)
 		return nil, nil

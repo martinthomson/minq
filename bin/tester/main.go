@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"strings"
 
 	"github.com/ekr/minq"
@@ -17,8 +18,12 @@ var dehex bool
 type stdoutTransport struct {
 }
 
-func (t *stdoutTransport) Send(p []byte) error {
+func (t *stdoutTransport) SendTo(p []byte, r *net.UDPAddr) error {
 	fmt.Printf("Output=%v", hex.Dump(p))
+	return nil
+}
+
+func (t *stdoutTransport) SetRemoteAddr(*net.UDPAddr) error {
 	return nil
 }
 
@@ -62,7 +67,12 @@ func main() {
 	strans := &stdoutTransport{}
 	config := minq.NewTlsConfig(serverName)
 	conn := minq.NewConnection(strans, minq.RoleServer, &config, nil)
-	err = conn.Input(in)
+	p := &minq.UdpPacket{
+		DestAddr: &net.UDPAddr{IP: []byte{192, 0, 0, 2}, Port: 443},
+		SrcAddr:  &net.UDPAddr{IP: []byte{192, 0, 0, 1}, Port: 443},
+		Data:     in,
+	}
+	err = conn.Input(p)
 	if err != nil {
 		fmt.Println("Couldn't process input: ", err)
 	}

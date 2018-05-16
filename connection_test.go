@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"testing"
 	"time"
 )
@@ -55,8 +56,12 @@ type testTransport struct {
 	w *testTransportPipe
 }
 
-func (t *testTransport) Send(p []byte) error {
+func (t *testTransport) SendTo(p []byte, r *net.UDPAddr) error {
 	t.w.Send(&testPacket{p})
+	return nil
+}
+
+func (t *testTransport) SetRemoteAddr(*net.UDPAddr) error {
 	return nil
 }
 
@@ -78,6 +83,11 @@ func newTestTransportPair(autoFlush bool) (a, b *testTransport) {
 	return
 }
 
+var (
+	dummyAddr1 = &net.UDPAddr{IP: []byte{192, 0, 0, 2}, Port: 443}
+	dummyAddr2 = &net.UDPAddr{IP: []byte{192, 0, 0, 1}, Port: 443}
+)
+
 func inputAll(c *Connection) error {
 	t := c.transport.(*testTransport)
 
@@ -91,7 +101,11 @@ func inputAll(c *Connection) error {
 			return nil
 		}
 
-		err = c.Input(p)
+		err = c.Input(&UdpPacket{
+			DestAddr: dummyAddr1,
+			SrcAddr:  dummyAddr2,
+			Data:     p,
+		})
 		if err != nil {
 			return err
 		}
@@ -114,7 +128,11 @@ func inputAllCapture(c *Connection) ([][]byte, error) {
 		}
 
 		ret = append(ret, p)
-		err = c.Input(p)
+		err = c.Input(&UdpPacket{
+			DestAddr: dummyAddr1,
+			SrcAddr:  dummyAddr2,
+			Data:     p,
+		})
 		if err != nil {
 			return ret, err
 		}
