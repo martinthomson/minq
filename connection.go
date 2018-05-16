@@ -502,34 +502,37 @@ func (c *Connection) determineAead(pt packetType) cipher.AEAD {
 	return aead
 }
 
-func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint64, payload []byte, remoteAddr *net.UDPAddr, containsOnlyAcks bool) ([]byte, error) {
+func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint64, payload []byte, p *path, containsOnlyAcks bool) ([]byte, error) {
 	c.log(logTypeConnection, "Sending packet PT=%v PN=%x: %s", pt, pn, dumpPacket(payload))
 	left := c.mtu // track how much space is left for payload
 
 	aead := c.determineAead(pt)
 	left -= aead.Overhead()
 
-	p := newPacket(pt, c.currentPath.remoteConnectionId,
+	packet := newPacket(pt, c.currentPath.remoteConnectionId,
 		c.currentPath.localConnectionId, version, pn, payload)
-	c.logPacket("Sending", &p.packetHeader, pn, payload)
+	c.logPacket("Sending", &packet.packetHeader, pn, payload)
 
 	// Encode the header so we know how long it is.
 	// TODO(ekr@rtfm.com): this is gross.
-	hdr, err := encode(&p.packetHeader)
+	hdr, err := encode(&packet.packetHeader)
 	if err != nil {
 		return nil, err
 	}
 	left -= len(hdr)
 	assert(left >= len(payload))
 
-	p.payload = payload
-	protected := aead.Seal(nil, c.packetNonce(p.PacketNumber), p.payload, hdr)
-	packet := append(hdr, protected...)
+	packet.payload = payload
+	protected := aead.Seal(nil, c.packetNonce(packet.PacketNumber), packet.payload, hdr)
+	b := append(hdr, protected...)
 
-	c.log(logTypeTrace, "Sending packet len=%d, len=%v", len(packet), hex.EncodeToString(packet))
-	c.currentPath.Send(pn, packet, containsOnlyAcks)
+	c.log(logTypeTrace, "Sending packet len=%d, len=%v", len(b), hex.EncodeToString(b))
 
-	return packet, nil
+	if p == nil {
+		p = c.currentPath
+	}
+	p.Send(pn, b, containsOnlyAcks)
+	return b, nil
 }
 
 // Send a packet with whatever PT seems appropriate now.
@@ -538,7 +541,7 @@ func (c *Connection) sendPacketNow(tosend []frame, containsOnlyAcks bool) ([]byt
 }
 
 // Send a packet with a specific PT.
-func (c *Connection) sendPacket(pt packetType, tosend []frame, remoteAddr *net.UDPAddr, containsOnlyAcks bool) ([]byte, error) {
+func (c *Connection) sendPacket(pt packetType, tosend []frame, p *path, containsOnlyAcks bool) ([]byte, error) {
 	sent := 0
 
 	payload := make([]byte, 0)
@@ -558,7 +561,7 @@ func (c *Connection) sendPacket(pt packetType, tosend []frame, remoteAddr *net.U
 	pn := c.nextSendPacket
 	c.nextSendPacket++
 
-	return c.sendPacketRaw(pt, c.version, pn, payload, remoteAddr, containsOnlyAcks)
+	return c.sendPacketRaw(pt, c.version, pn, payload, p, containsOnlyAcks)
 }
 
 // sendOnStream0 is used prior to the handshake completing.  Stream 0 is exempt
@@ -1053,20 +1056,33 @@ func (c *Connection) input(packet *UdpPacket) error {
 	return err
 }
 
-func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
+func (c *Connection) getOrMakePath(remoteAddr *net.UDPAddr) (*path, error) {
 	p := c.paths[remoteAddr.String()]
-	if p == nil {
-		t, err := c.transportFactory.MakeTransport(remoteAddr)
-		if err != nil {
-			return err
-		}
-		p = &path{
-			remoteConnectionId: nil, // TODO: get saved CID
-			localConnectionId:  nil, // TODO: get advertised CID and send NEW_CONNECTION_ID
-			transport:          t,
-			congestion:         &CongestionControllerDummy{},
-		}
-		// TODO copy RTT information from the existing congestion controller.
+	if p != nil {
+		return p, nil
+	}
+
+	c.log(logTypeConnection, "opening new path to %v", remoteAddr)
+	t, err := c.transportFactory.MakeTransport(remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+	p = &path{
+		remoteConnectionId: nil, // TODO: get saved CID
+		localConnectionId:  nil, // TODO: get advertised CID and send NEW_CONNECTION_ID
+		transport:          t,
+		congestion:         &CongestionControllerDummy{},
+	}
+	// TODO copy RTT information from the current path.
+	c.paths[remoteAddr.String()] = p
+	return p, nil
+}
+
+func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
+	c.log(logTypeConnection, "migrating to %v", remoteAddr)
+	p, err := c.getOrMakePath(remoteAddr)
+	if err != nil {
+		return err
 	}
 	c.currentPath = p
 	return nil
@@ -1650,7 +1666,14 @@ func (c *Connection) processUnprotected(udp *UdpPacket, hdr *packetHeader, packe
 			c.log(logTypeConnection, "Received path challenge")
 			// TODO use new connection ID here
 			frames := []frame{newPathResponseFrame(inner.Data[:])}
-			_, err = c.sendPacket(packetTypeProtectedShort, frames, udp.SrcAddr, false)
+			p, err := c.getOrMakePath(udp.SrcAddr)
+			if err != nil {
+				return err
+			}
+			_, err = c.sendPacket(packetTypeProtectedShort, frames, p, false)
+			if err != nil {
+				c.log(logTypeConnection, "couldn't send PATH_RESPONSE")
+			}
 
 			isProbingFrame = true
 
