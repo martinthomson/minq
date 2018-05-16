@@ -8,19 +8,19 @@ import (
 
 // fake TransportFactory that comes populated with
 // a set of pre-fab transports keyed by name.
-type testTransportFactory struct {
+type testTransportFactoryMap struct {
 	transports map[string]*testTransport
 }
 
-func (f *testTransportFactory) MakeTransport(remote *net.UDPAddr) (Transport, error) {
+func (f *testTransportFactoryMap) MakeTransport(remote *net.UDPAddr) (Transport, error) {
 	return f.transports[remote.String()], nil
 }
 
-func (f *testTransportFactory) addTransport(remote *net.UDPAddr, t *testTransport) {
+func (f *testTransportFactoryMap) addTransport(remote *net.UDPAddr, t *testTransport) {
 	f.transports[remote.String()] = t
 }
 
-func serverInputAll(t *testing.T, trans *testTransport, s *Server, u net.UDPAddr) (*Connection, error) {
+func serverInputAll(t *testing.T, trans *testTransport, s *Server, srcAddr *net.UDPAddr) (*Connection, error) {
 	var clast *Connection
 
 	for {
@@ -33,7 +33,11 @@ func serverInputAll(t *testing.T, trans *testTransport, s *Server, u net.UDPAddr
 			return clast, nil
 		}
 
-		c, err := s.Input(&UdpPacket{DestAddr: &u, SrcAddr: &u, Data: p})
+		c, err := s.Input(&UdpPacket{
+			DestAddr: dummyAddr1,
+			SrcAddr:  srcAddr,
+			Data:     p,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -47,45 +51,38 @@ func serverInputAll(t *testing.T, trans *testTransport, s *Server, u net.UDPAddr
 
 func TestServer(t *testing.T) {
 	// Have the client and server do a handshake.
-	u, _ := net.ResolveUDPAddr("udp", "127.0.0.1:4443") // Just a fixed address
-
 	cTrans, sTrans := newTestTransportPair(true)
-	factory := &testTransportFactory{make(map[string]*testTransport)}
-	factory.addTransport(u, sTrans)
-
-	server := NewServer(factory, testTlsConfig(), nil)
+	server := NewServer(sTrans, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
-	client := NewConnection(cTrans, RoleClient, testTlsConfig(), nil)
+	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
 	n, err := client.CheckTimer()
 	assertEquals(t, 1, n)
 	assertNotError(t, err, "Couldn't send client initial")
 
-	s1, err := serverInputAll(t, sTrans, server, *u)
+	s1, err := serverInputAll(t, sTrans.t, server, dummyAddr2)
 	assertNotError(t, err, "Couldn't consume client initial")
 
 	err = inputAll(client)
 	assertNotError(t, err, "Error processing SH")
 
-	s2, err := serverInputAll(t, sTrans, server, *u)
+	s2, err := serverInputAll(t, sTrans.t, server, dummyAddr2)
 	assertNotError(t, err, "Error processing CFIN")
 	// Make sure we get the same server back.
 	assertEquals(t, s1, s2)
 
 	// Now make a new client and ensure we get a different server connection
-	u2, _ := net.ResolveUDPAddr("udp", "127.0.0.1:4444") // Just a fixed address
-	cTrans2, sTrans2 := newTestTransportPair(true)
-	factory.addTransport(u2, sTrans2)
-	client = NewConnection(cTrans2, RoleClient, testTlsConfig(), nil)
+	cTrans2 := sTrans.newPairedTransport(true)
+	client = NewConnection(cTrans2, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
 	n, err = client.CheckTimer()
 	assertEquals(t, 1, n)
 	assertNotError(t, err, "Couldn't send client initial")
 
-	s3, err := serverInputAll(t, sTrans2, server, *u2)
+	s3, err := serverInputAll(t, sTrans.t, server, dummyAddr3)
 	assertNotError(t, err, "Couldn't consume client initial")
 
 	assertX(t, s1 != s3, "Got the same server connection back with a different address")
@@ -94,23 +91,18 @@ func TestServer(t *testing.T) {
 
 func TestServerIdleTimeout(t *testing.T) {
 	// Have the client and server do a handshake.
-	u, _ := net.ResolveUDPAddr("udp", "127.0.0.1:4443") // Just a fixed address
-
 	cTrans, sTrans := newTestTransportPair(true)
-	factory := &testTransportFactory{make(map[string]*testTransport)}
-	factory.addTransport(u, sTrans)
-
-	server := NewServer(factory, testTlsConfig(), nil)
+	server := NewServer(sTrans, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
 
-	client := NewConnection(cTrans, RoleClient, testTlsConfig(), nil)
+	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
 	n, err := client.CheckTimer()
 	assertEquals(t, 1, n)
 	assertNotError(t, err, "Couldn't send client initial")
 
-	sconn, err := serverInputAll(t, sTrans, server, *u)
+	sconn, err := serverInputAll(t, sTrans.t, server, dummyAddr2)
 	assertNotError(t, err, "Couldn't consume client initial")
 	assertNotNil(t, sconn, "no server connection")
 

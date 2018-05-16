@@ -52,11 +52,10 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 	if conn == nil {
 		logf(logTypeServer, "New server connection from addr %v", addr)
-		trans, err := s.transFactory.MakeTransport(addr)
-		if err != nil {
-			return nil, err
+		conn = newServerConnection(s.transFactory, addr, s.tls)
+		if conn == nil {
+			return nil, fatalError("unable to create server")
 		}
-		conn = NewConnection(trans, RoleServer, s.tls, nil)
 		newConn = true
 	}
 
@@ -71,7 +70,10 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 		// to the table.  Firstly, to avoid having to remove it if there is an
 		// error, but also because the server-chosen connection ID isn't set
 		// until after the Initial is handled.
-		s.idTable[conn.serverConnectionId.String()] = conn
+
+		// TODO: have server connections manage their own entries in the table so
+		// that they can use NEW_CONNECTION_ID and connection migration.
+		s.idTable[conn.ServerId().String()] = conn
 		s.addrTable[addr.String()] = conn
 		if s.handler != nil {
 			s.handler.NewConnection(conn)
@@ -87,7 +89,7 @@ func (s *Server) CheckTimer() error {
 		_, err := conn.CheckTimer()
 		if isFatalError(err) {
 			logf(logTypeServer, "Fatal Error %v killing connection %v", err, conn)
-			delete(s.idTable, conn.serverConnectionId.String())
+			delete(s.idTable, conn.ServerId().String())
 			// TODO(ekr@rtfm.com): Delete this from the addr table.
 		}
 	}

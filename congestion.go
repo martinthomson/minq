@@ -37,7 +37,6 @@ type CongestionController interface {
 	bytesAllowedToSend() int
 	setLostPacketHandler(handler func(pn uint64))
 	rto() time.Duration
-	reset()
 }
 
 /*
@@ -63,9 +62,6 @@ func (cc *CongestionControllerDummy) setLostPacketHandler(handler func(pn uint64
 
 func (cc *CongestionControllerDummy) rto() time.Duration {
 	return kMinRTOTimeout
-}
-
-func (cc *CongestionControllerDummy) reset() {
 }
 
 // CongestionControllerIetf implements the congestion control algorithm

@@ -92,6 +92,22 @@ type ackRange struct {
 
 type ackRanges []ackRange
 
+type path struct {
+	remoteConnectionId ConnectionId
+	localConnectionId  ConnectionId
+	transport          Transport
+	congestion         CongestionController
+}
+
+func (p *path) String() string {
+	return fmt.Sprintf("%v_%v", p.localConnectionId, p.remoteConnectionId)
+}
+
+func (p *path) Send(pn uint64, packet []byte, ackOnly bool) error {
+	p.congestion.onPacketSent(pn, ackOnly, len(packet))
+	return p.transport.Send(packet)
+}
+
 /*
 Connection represents a QUIC connection. Clients can make
 connections directly but servers should create a minq.Server
@@ -113,9 +129,9 @@ type Connection struct {
 	role               Role
 	state              State
 	version            VersionNumber
-	clientConnectionId ConnectionId
-	serverConnectionId ConnectionId
-	transport          Transport
+	currentPath        *path
+	paths              map[string]*path
+	transportFactory   TransportFactory
 	tls                *tlsConn
 	writeClear         *cryptoState
 	readClear          *cryptoState
@@ -141,23 +157,32 @@ type Connection struct {
 	tpHandler          *transportParametersHandler
 	log                loggingFunction
 	retransmitTime     time.Duration
-	congestion         CongestionController
 	lastSendQueuedTime time.Time
 	closingEnd         time.Time
 	closePacket        []byte
 }
 
-// Create a new QUIC connection. Should only be used with role=RoleClient,
-// though we use it with RoleServer internally.
-func NewConnection(trans Transport, role Role, tls *TlsConfig, handler ConnectionHandler) *Connection {
+// newConnection creates a new QUIC connection.
+func newConnection(tf TransportFactory, remoteAddr *net.UDPAddr, role Role, tls *TlsConfig, handler ConnectionHandler) *Connection {
+	transport, err := tf.MakeTransport(remoteAddr)
+	if err != nil {
+		return nil
+	}
+	p := &path{
+		localConnectionId:  nil,
+		remoteConnectionId: nil,
+		transport:          transport,
+		congestion:         &CongestionControllerDummy{},
+		//congestion: newCongestionControllerIetf(c),
+	}
 	c := &Connection{
 		handler:            handler,
 		role:               role,
 		state:              StateInit,
 		version:            kQuicVersion,
-		clientConnectionId: nil,
-		serverConnectionId: nil,
-		transport:          trans,
+		currentPath:        p,
+		paths:              map[string]*path{remoteAddr.String(): p},
+		transportFactory:   tf,
 		tls:                newTlsConn(tls, role),
 		writeClear:         nil,
 		readClear:          nil,
@@ -183,7 +208,6 @@ func NewConnection(trans Transport, role Role, tls *TlsConfig, handler Connectio
 		tpHandler:          nil,
 		log:                nil,
 		retransmitTime:     kDefaultInitialRtt,
-		congestion:         nil,
 		lastSendQueuedTime: time.Now(),
 		closingEnd:         time.Time{}, // Zero time
 		closePacket:        nil,
@@ -191,9 +215,7 @@ func NewConnection(trans Transport, role Role, tls *TlsConfig, handler Connectio
 
 	c.log = newConnectionLogger(c)
 
-	//c.congestion = newCongestionControllerIetf(c)
-	c.congestion = &CongestionControllerDummy{}
-	c.congestion.setLostPacketHandler(c.handleLostPacket)
+	p.congestion.setLostPacketHandler(c.handleLostPacket)
 
 	// TODO(ekr@rtfm.com): This isn't generic, but rather tied to
 	// Mint.
@@ -203,23 +225,22 @@ func NewConnection(trans Transport, role Role, tls *TlsConfig, handler Connectio
 	c.recvd = newRecvdPackets(c.log)
 
 	var clientStreams *streamSet
-	var err error
 	if role == RoleClient {
-		c.serverConnectionId, err = c.randomConnectionId(8)
+		p.remoteConnectionId, err = c.randomConnectionId(8)
 		if err != nil {
 			return nil
 		}
-		c.clientConnectionId, err = c.randomConnectionId(kCidDefaultLength)
+		p.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
 		if err != nil {
 			return nil
 		}
-		err = c.setupAeadMasking(c.serverConnectionId)
+		err = c.setupAeadMasking(p.remoteConnectionId)
 		if err != nil {
 			return nil
 		}
 		clientStreams = c.localBidiStreams
 	} else {
-		c.serverConnectionId, err = c.randomConnectionId(kCidDefaultLength)
+		p.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
 		if err != nil {
 			return nil
 		}
@@ -237,8 +258,17 @@ func NewConnection(trans Transport, role Role, tls *TlsConfig, handler Connectio
 	return c
 }
 
+// NewConnection makes a new client connection.
+func NewConnection(tf TransportFactory, remoteAddr *net.UDPAddr, tls *TlsConfig, handler ConnectionHandler) *Connection {
+	return newConnection(tf, remoteAddr, RoleClient, tls, handler)
+}
+
+func newServerConnection(tf TransportFactory, remoteAddr *net.UDPAddr, tls *TlsConfig) *Connection {
+	return newConnection(tf, remoteAddr, RoleServer, tls, nil)
+}
+
 func (c *Connection) String() string {
-	return fmt.Sprintf("Conn: %v_%v: %s", c.clientConnectionId, c.serverConnectionId, c.role)
+	return fmt.Sprintf("Conn: %v: %s", c.currentPath, c.role)
 }
 
 func (c *Connection) zeroRttAllowed() bool {
@@ -304,12 +334,18 @@ func (state State) String() string {
 
 // ClientId returns the current identity, as dictated by the client.
 func (c *Connection) ClientId() ConnectionId {
-	return c.clientConnectionId
+	if c.role == RoleClient {
+		return c.currentPath.localConnectionId
+	}
+	return c.currentPath.remoteConnectionId
 }
 
 // ServerId returns the current identity, as dictated by the server.
 func (c *Connection) ServerId() ConnectionId {
-	return c.serverConnectionId
+	if c.role == RoleServer {
+		return c.currentPath.localConnectionId
+	}
+	return c.currentPath.remoteConnectionId
 }
 
 func (c *Connection) ensureRemoteBidi(id uint64) hasIdentity {
@@ -423,7 +459,8 @@ func (c *Connection) sendClientInitial() error {
 	   attacks caused by server responses toward an unverified client
 	   address.
 	*/
-	topad := kMinimumClientInitialLength - (l + c.packetOverhead(packetTypeInitial))
+	overhead := c.packetOverhead(c.currentPath, packetTypeInitial)
+	topad := kMinimumClientInitialLength - (l + overhead)
 	c.log(logTypeHandshake, "Padding with %d padding frames", topad)
 
 	// Enqueue the frame for transmission.
@@ -472,17 +509,8 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 	aead := c.determineAead(pt)
 	left -= aead.Overhead()
 
-	var destCid ConnectionId
-	var srcCid ConnectionId
-	if c.role == RoleClient {
-		destCid = c.serverConnectionId
-		srcCid = c.clientConnectionId
-	} else {
-		srcCid = c.serverConnectionId
-		destCid = c.clientConnectionId
-	}
-
-	p := newPacket(pt, destCid, srcCid, version, pn, payload)
+	p := newPacket(pt, c.currentPath.remoteConnectionId,
+		c.currentPath.localConnectionId, version, pn, payload)
 	c.logPacket("Sending", &p.packetHeader, pn, payload)
 
 	// Encode the header so we know how long it is.
@@ -499,8 +527,7 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 	packet := append(hdr, protected...)
 
 	c.log(logTypeTrace, "Sending packet len=%d, len=%v", len(packet), hex.EncodeToString(packet))
-	c.congestion.onPacketSent(pn, containsOnlyAcks, len(packet)) //TODO(piet@devae.re) check isackonly
-	c.transport.SendTo(packet, remoteAddr)
+	c.currentPath.Send(pn, packet, containsOnlyAcks)
 
 	return packet, nil
 }
@@ -683,24 +710,15 @@ func (c *Connection) sendFrame(f frame) error {
 	return err
 }
 
-func (c *Connection) packetOverhead(pt packetType) int {
+func (c *Connection) packetOverhead(p *path, pt packetType) int {
 	overhead := c.determineAead(pt).Overhead()
 	if pt.isLongHeader() {
 		overhead += kLongHeaderLength
-		if c.role == RoleClient {
-			overhead += len(c.clientConnectionId)
-		} else {
-			overhead += len(c.serverConnectionId)
-		}
+		overhead += len(p.localConnectionId)
 	} else {
 		overhead += 5
 	}
-	if c.role == RoleClient {
-		overhead += len(c.serverConnectionId)
-	} else {
-		overhead += len(c.clientConnectionId)
-	}
-	return overhead
+	return overhead + len(p.remoteConnectionId)
 }
 
 /* Transmit all the frames permitted by connection level flow control and
@@ -713,7 +731,7 @@ func (c *Connection) sendQueuedFrames(pt packetType, protected bool, bareAcks bo
 	now := time.Now()
 	txAge := c.retransmitTime * time.Millisecond
 	sent := int(0)
-	spaceInCongestionWindow := c.congestion.bytesAllowedToSend()
+	spaceInCongestionWindow := c.currentPath.congestion.bytesAllowedToSend()
 
 	// Select the queue we will send from
 	var queue *[]frame
@@ -732,7 +750,7 @@ func (c *Connection) sendQueuedFrames(pt packetType, protected bool, bareAcks bo
 	// Store frames that will be sent in the next packet
 	frames := make([]frame, 0)
 	// Calculate available space in the next packet.
-	overhead := c.packetOverhead(pt)
+	overhead := c.packetOverhead(c.currentPath, pt)
 	spaceInPacket := c.mtu - overhead
 	spaceInCongestionWindow -= overhead
 
@@ -881,7 +899,7 @@ func (c *Connection) input(packet *UdpPacket) error {
 	if c.state == StateClosing {
 		c.log(logTypeConnection, "Discarding packet while closing (closePacket=%v)", c.closePacket != nil)
 		if c.closePacket != nil {
-			c.transport.SendTo(c.closePacket, nil)
+			c.currentPath.transport.Send(c.closePacket)
 		}
 		return ErrorConnIsClosing
 	}
@@ -936,11 +954,11 @@ func (c *Connection) input(packet *UdpPacket) error {
 		if err != nil {
 			return err
 		}
-		c.serverConnectionId, err = c.randomConnectionId(kCidDefaultLength)
+		c.currentPath.localConnectionId, err = c.randomConnectionId(kCidDefaultLength)
 		if err != nil {
 			return err
 		}
-		c.clientConnectionId = hdr.SourceConnectionID
+		c.currentPath.remoteConnectionId = hdr.SourceConnectionID
 	}
 
 	aead := c.readClear.aead
@@ -1036,11 +1054,21 @@ func (c *Connection) input(packet *UdpPacket) error {
 }
 
 func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
-	err := c.transport.SetRemoteAddr(remoteAddr)
-	if err != nil {
-		return err
+	p := c.paths[remoteAddr.String()]
+	if p == nil {
+		t, err := c.transportFactory.MakeTransport(remoteAddr)
+		if err != nil {
+			return err
+		}
+		p = &path{
+			remoteConnectionId: nil, // TODO: get saved CID
+			localConnectionId:  nil, // TODO: get advertised CID and send NEW_CONNECTION_ID
+			transport:          t,
+			congestion:         &CongestionControllerDummy{},
+		}
+		// TODO copy RTT information from the existing congestion controller.
 	}
-	c.congestion.reset()
+	c.currentPath = p
 	return nil
 }
 
@@ -1186,7 +1214,7 @@ func (c *Connection) processCleartext(hdr *packetHeader, payload []byte, ackOnly
 				// TODO: don't let the server change its mind.  This is complicated
 				// because each flight is multiple packets, and Handshake and Retry
 				// packets can each set a different value.
-				c.serverConnectionId = hdr.SourceConnectionID
+				c.currentPath.remoteConnectionId = hdr.SourceConnectionID
 			} else {
 				if c.state != StateWaitClientSecondFlight {
 					// TODO(ekr@rtfm.com): Not clear what to do here. It's
@@ -1305,7 +1333,7 @@ func (c *Connection) sendVersionNegotiation(hdr packetHeader) error {
 	// Note that we do not update the congestion controller for this packet.
 	// This connection is about to disappear anyway.  Our defense against being
 	// used as an amplifier is the size check above.
-	c.transport.SendTo(packet, nil)
+	c.currentPath.transport.Send(packet)
 	return nil
 }
 
@@ -1747,7 +1775,9 @@ func (c *Connection) processAckFrame(f *ackFrame, protected bool) error {
 		receivedAcks = append(receivedAcks, ackRange{end, end - start})
 	}
 
-	c.congestion.onAckReceived(receivedAcks, ackDelay)
+	for _, p := range c.paths {
+		p.congestion.onAckReceived(receivedAcks, ackDelay)
+	}
 
 	return nil
 }
@@ -1968,7 +1998,7 @@ func (c *Connection) close(code ErrorCode, reason string, savePacket bool) error
 		return nil
 	}
 
-	c.closingEnd = time.Now().Add(3 * c.congestion.rto())
+	c.closingEnd = time.Now().Add(3 * c.currentPath.congestion.rto())
 	c.setState(StateClosing)
 	f := newConnectionCloseFrame(code, reason)
 	closePacket, err := c.sendPacketNow([]frame{f}, false)
