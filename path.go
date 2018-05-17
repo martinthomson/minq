@@ -45,13 +45,13 @@ func (p *path) calculateChallenge(i byte, k []byte) []byte {
 	return append(first, h[:7]...)
 }
 
-func (p *path) GeneratePathChallenge() (frame, error) {
+func (p *path) GeneratePathChallenge() (*frame, error) {
 	if p.verificationKey == nil || p.verificationCounter == 255 {
 		p.oldVerificationKey = p.verificationKey
 		p.verificationKey = make([]byte, 15)
 		_, err := io.ReadFull(rand.Reader, p.verificationKey)
 		if err != nil {
-			return frame{}, err
+			return nil, err
 		}
 		p.verificationCounter = 0
 	}

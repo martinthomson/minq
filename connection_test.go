@@ -272,6 +272,9 @@ func TestSendReceiveCISI(t *testing.T) {
 	err = inputAll(server)
 	assertNotError(t, err, "Error processing CFIN")
 
+	err = inputAll(client)
+	assertNotError(t, err, "NEW_CONNECTION_ID not consumed")
+
 	fmt.Println("Checking client state")
 	assertEquals(t, client.state, StateEstablished)
 	fmt.Println("Checking server state")
