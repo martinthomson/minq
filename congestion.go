@@ -306,24 +306,6 @@ func (cc *CongestionControllerIetf) bytesAllowedToSend() int {
 	return cc.congestionWindow - cc.bytesInFlight
 }
 
-func (cc *CongestionControllerIetf) reset() {
-	cc.bytesInFlight = 0
-	cc.congestionWindow = kInitialWindow
-	cc.endOfRecovery = 0
-	cc.sstresh = int(^uint(0) >> 1)
-	cc.lossDetectionAlarm = 0
-	cc.handshakeCount = 0
-	cc.tlpCount = 0
-	cc.rtoCount = 0
-	cc.largestSendBeforeRto = 0
-	cc.timeOfLastSentPacket = time.Unix(0, 0)
-	cc.largestSendPacket = 0
-	cc.largestAckedPacket = 0
-	cc.minRtt = 100 * time.Second
-	// keep RTT estimates
-	// keep configuration
-}
-
 func newCongestionControllerIetf(conn *Connection) *CongestionControllerIetf {
 	return &CongestionControllerIetf{
 		0,                            // bytesInFlight
