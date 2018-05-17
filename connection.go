@@ -527,7 +527,7 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 	left -= aead.Overhead()
 
 	packet := newPacket(pt, c.currentPath.remoteConnectionId,
-		c.currentPath.localConnectionId, version, pn, payload)
+		c.currentPath.localConnectionId, version, pn, payload, aead.Overhead())
 	c.logPacket("Sending", &packet.packetHeader, pn, payload)
 
 	// Encode the header so we know how long it is.
@@ -980,15 +980,27 @@ func (c *Connection) input(packet *UdpPacket) error {
 	c.lastInput = time.Now()
 
 	hdr := packetHeader{shortCidLength: kCidDefaultLength}
-	p := packet.Data
+	payload := packet.Data
 
-	c.log(logTypeTrace, "Receiving packet len=%v %v", len(p), hex.EncodeToString(p))
-	hdrlen, err := decode(&hdr, p)
+	c.log(logTypeTrace, "Receiving packet len=%v %v", len(payload), hex.EncodeToString(payload))
+	hdrlen, err := decode(&hdr, payload)
 	if err != nil {
-		c.log(logTypeConnection, "Could not decode packetX: %v", hex.EncodeToString(p))
+		c.log(logTypeConnection, "Could not decode packetX: %v", hex.EncodeToString(payload))
 		return wrapE(ErrorInvalidPacket, err)
 	}
-	assert(int(hdrlen) <= len(p))
+	assert(int(hdrlen) <= len(payload))
+
+	var remainder *UdpPacket
+	thisPacketLen := int(hdrlen + uintptr(hdr.PayloadLength))
+	if hdr.Type.isLongHeader() && thisPacketLen < len(payload) {
+		c.log(logTypeTrace, "Compound packet %x first part=%d", hdr.PacketNumber, len(payload)-thisPacketLen)
+		remainder = &UdpPacket{
+			DestAddr: packet.DestAddr,
+			SrcAddr:  packet.SrcAddr,
+			Data:     payload[thisPacketLen:],
+		}
+		payload = payload[:thisPacketLen]
+	}
 
 	if hdr.Type.isLongHeader() && hdr.Version != c.version {
 		if c.role == RoleServer {
@@ -1011,11 +1023,11 @@ func (c *Connection) input(packet *UdpPacket) error {
 	}
 
 	typ := hdr.getHeaderType()
-	c.log(logTypeTrace, "Received packet %x len=%d", hdr.PacketNumber, len(p))
+	c.log(logTypeTrace, "Received packet %x len=%d", hdr.PacketNumber, len(payload))
 	c.log(logTypeConnection, "Packet header %v, %d", hdr, typ)
 
 	if hdr.Type.isLongHeader() && hdr.Version == 0 {
-		return c.processVersionNegotiation(&hdr, p[hdrlen:])
+		return c.processVersionNegotiation(&hdr, payload[hdrlen:])
 	}
 
 	if c.state == StateWaitClientInitial {
@@ -1056,16 +1068,16 @@ func (c *Connection) input(packet *UdpPacket) error {
 		return nonFatalError(fmt.Sprintf("Duplicate packet id %x", packetNumber))
 	}
 
-	payload, err := aead.Open(nil, c.packetNonce(packetNumber), p[hdrlen:], p[:hdrlen])
+	plaintext, err := aead.Open(nil, c.packetNonce(packetNumber),
+		payload[hdrlen:], payload[:hdrlen])
 	if err != nil {
-		c.log(logTypeConnection, "Could not unprotect packet %x", p)
-		c.log(logTypeTrace, "Packet %h", p)
+		c.log(logTypeConnection, "Could not unprotect packet %x", packet.Data)
 		return wrapE(ErrorInvalidPacket, err)
 	}
 
 	// Now that we know it's valid, process stateless retry.
 	if typ == packetTypeRetry {
-		return c.processStatelessRetry(&hdr, payload)
+		return c.processStatelessRetry(&hdr, plaintext)
 	}
 
 	if !c.recvd.initialized() {
@@ -1075,16 +1087,16 @@ func (c *Connection) input(packet *UdpPacket) error {
 
 	// We have now verified that this is a valid packet, so mark
 	// it received.
-	c.logPacket("Received", &hdr, packetNumber, payload)
+	c.logPacket("Received", &hdr, packetNumber, plaintext)
 	probing := false
 	ackOnly := true
 	switch typ {
 	case packetTypeInitial:
-		err = c.processClientInitial(&hdr, payload)
+		err = c.processClientInitial(&hdr, plaintext)
 	case packetTypeHandshake:
-		err = c.processCleartext(&hdr, payload, &ackOnly)
+		err = c.processCleartext(&hdr, plaintext, &ackOnly)
 	case packetTypeProtectedShort:
-		err = c.processUnprotected(packet, &hdr, packetNumber, payload, &ackOnly, &probing)
+		err = c.processUnprotected(packet, &hdr, packetNumber, plaintext, &ackOnly, &probing)
 	default:
 		c.log(logTypeConnection, "Unsupported packet type %v", typ)
 		err = internalError("Unsupported packet type %v", typ)
@@ -1119,7 +1131,10 @@ func (c *Connection) input(packet *UdpPacket) error {
 		}
 	}
 
-	return err
+	if remainder != nil {
+		return c.input(remainder)
+	}
+	return nil
 }
 
 func (c *Connection) getOrMakePath(remoteAddr *net.UDPAddr) (*path, error) {
@@ -1436,7 +1451,7 @@ func (c *Connection) sendVersionNegotiation(hdr packetHeader) error {
 
 	c.log(logTypeConnection, "Sending version negotiation packet")
 	p := newPacket(packetType(pt[0]&0x7f), hdr.SourceConnectionID, hdr.DestinationConnectionID,
-		0, hdr.PacketNumber, payload)
+		0, hdr.PacketNumber, payload, 0)
 
 	header, err := encode(&p.packetHeader)
 	if err != nil {
