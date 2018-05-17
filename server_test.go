@@ -146,6 +146,7 @@ func TestServerStatelessReset(t *testing.T) {
 
 	cid := client.ServerId()
 	resetToken := client.currentPath.resetToken
+	assertEquals(t, len(resetToken), 16)
 
 	client.Close()
 	snil, err := serverInputAll(t, serverTransport, server, dummyAddr2)
@@ -156,15 +157,18 @@ func TestServerStatelessReset(t *testing.T) {
 	assertEquals(t, err, ErrorConnIsClosed)
 	assertEquals(t, 0, server.ConnectionCount())
 
+	// Make a packet that seems to be for the now-removed connection.
+	shortHeader := make([]byte, 50) // Got to be long enough.
+	shortHeader[0] = byte(packetFlagShortHeader)
+	copy(shortHeader[1:], cid) // Copy the connection ID in.
+	_, err = io.ReadFull(rand.Reader, shortHeader[1+len(cid):])
+	assertNotError(t, err, "random reading")
+
 	// Make a new transport for the server, ignore the client side and just
 	// read the stateless reset from the buffer on the server side.
 	_ = sTrans.newPairedTransport(false)
 	serverTransport = sTrans.t
 
-	shortHeader := make([]byte, 50) // Got to be long enough.
-	copy(shortHeader[1:], cid)      // Copy the connection ID in.
-	_, err = io.ReadFull(rand.Reader, shortHeader[1+len(cid):])
-	assertNotError(t, err, "random reading")
 	_, err = server.Input(&UdpPacket{
 		DestAddr: dummyAddr1,
 		SrcAddr:  dummyAddr2,
@@ -173,5 +177,17 @@ func TestServerStatelessReset(t *testing.T) {
 	assertError(t, err, "should generate an error")
 	assertEquals(t, len(serverTransport.w.in), 1)
 	packet := serverTransport.w.in[0].b
-	assertByteEquals(t, packet[len(packet)-16:], resetToken)
+	assertByteEquals(t, packet[len(packet)-len(resetToken):], resetToken)
+
+	_ = sTrans.newPairedTransport(false)
+	serverTransport = sTrans.t
+
+	_, err = server.Input(&UdpPacket{
+		DestAddr: dummyAddr1,
+		SrcAddr:  dummyAddr2,
+		Data:     shortHeader[:18+len(cid)],
+	})
+	assertError(t, err, "should generate an error")
+	// Should have sent nothing though.
+	assertEquals(t, len(serverTransport.w.in), 0)
 }

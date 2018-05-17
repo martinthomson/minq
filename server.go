@@ -10,7 +10,10 @@ import (
 )
 
 // The number of octets we can receive before we sent a stateless reset.
-const kStatelessResetMinimum = 40
+// This the minimal header (our cid length plus 1 each for first octet and PN),
+// Plus one octet of content and an integrity check (which we assume isn't
+// smaller than the initial integrity check of 16).
+const kStatelessResetMinimum = 2 + kCidDefaultLength + 1 + kInitialIntegrityCheckLength
 
 type connectionTable struct {
 	idTable        map[string]*Connection
@@ -189,17 +192,25 @@ func (s *Server) sendStatelessReset(cid ConnectionId, remoteAddr *net.UDPAddr) e
 	if err != nil {
 		return err
 	}
+	// We have to assume that the peer wanted a maximum-sized connection ID,
+	//  that means that the packet will be at least 21 octets without the
+	// integrity check (1 for first octet, 1 for packet number, 1 for some content).
+	// Assume that the integrity check is 16 octets, which is the same size as the
+	// reset token.
 	sr := make([]byte, 21)
 	_, err = io.ReadFull(rand.Reader, sr)
 	if err != nil {
 		return err
 	}
+	// Add up to another 15 octets, using randomness from the first octet,
+	// which is then replaced so that this looks like a short header.
 	extra := make([]byte, int(sr[0]&0xf))
 	_, err = io.ReadFull(rand.Reader, extra)
 	if err != nil {
 		return err
 	}
-	sr[0] = 0x43
+	// Keep the random K and add the short header flags.
+	sr[0] = (sr[0] & byte(packetFlagK)) | byte(packetFlagShortHeader)
 	sr = append(sr, append(extra, token...)...)
 
 	t, err := s.transFactory.MakeTransport(remoteAddr)
