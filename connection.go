@@ -545,9 +545,6 @@ func (c *Connection) sendPacketRaw(pt packetType, version VersionNumber, pn uint
 
 	c.log(logTypeTrace, "Sending packet len=%d, len=%v", len(b), hex.EncodeToString(b))
 
-	if p == nil {
-		p = c.currentPath
-	}
 	p.Send(pn, b, containsOnlyAcks)
 	return b, nil
 }
@@ -1779,6 +1776,8 @@ func (c *Connection) processUnprotected(udp *UdpPacket, hdr *packetHeader, packe
 			if p != nil {
 				p.VerifyPathResponse(inner.Data[:])
 			}
+
+			isProbingFrame = true
 
 		case *newConnectionIdFrame:
 			if len(c.currentPath.remoteConnectionId) == 0 {
