@@ -799,6 +799,13 @@ func (c *Connection) sendQueuedFrames(pt packetType, protected bool, bareAcks bo
 		queue = &c.outputClearQ
 	}
 
+	if c.currentPath.packetsAllowed < 1000 {
+		challenge, err := c.currentPath.GeneratePathChallenge()
+		if err != nil {
+			c.queueFrame(queue, challenge)
+		}
+	}
+
 	/* Iterate through the queue, and append frames to packet, sending
 	 * packets when the maximum packet size is reached, or we are not
 	 * allowed to send more from the congestion controller */
@@ -1142,7 +1149,7 @@ func (c *Connection) getOrMakePath(remoteAddr *net.UDPAddr) (*path, error) {
 		transport:          t,
 		remoteAddr:         remoteAddr,
 		congestion:         &CongestionControllerDummy{},
-		packetsAllowed:     ^uint(0),
+		packetsAllowed:     100,
 	}
 	c.unusedRemoteCids = c.unusedRemoteCids[1:]
 	c.unusedLocalCids = c.unusedLocalCids[1:]
@@ -1158,10 +1165,6 @@ func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
 		return err
 	}
 	c.currentPath = p
-	challenge, err := p.GeneratePathChallenge()
-	if err != nil {
-		c.queueFrame(&c.outputProtectedQ, challenge)
-	}
 	return nil
 }
 

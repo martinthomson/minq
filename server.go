@@ -59,10 +59,6 @@ func (ct *connectionTable) GetAddr(remoteAddr *net.UDPAddr) *Connection {
 	return ct.addrTable[remoteAddr.String()]
 }
 
-func (ct *connectionTable) Count() int {
-	return len(ct.idTable)
-}
-
 func (ct *connectionTable) Remove(cid ConnectionId, remoteAddr *net.UDPAddr) {
 	ct.RemoveCid(cid)
 	delete(ct.addrTable, remoteAddr.String())
@@ -102,7 +98,7 @@ type Server struct {
 	handler      ServerHandler
 	transFactory TransportFactory
 	tls          *TlsConfig
-	connectionTable
+	table        connectionTable
 }
 
 // Interface for the handler object which the Server will call
@@ -134,14 +130,14 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 
 	if len(hdr.DestinationConnectionID) > 0 {
 		logf(logTypeServer, "Received conn id %v", hdr.DestinationConnectionID)
-		conn = s.Get(hdr.DestinationConnectionID)
+		conn = s.table.Get(hdr.DestinationConnectionID)
 		if conn != nil {
 			logf(logTypeServer, "Found by conn id")
 		}
 	}
 
 	if conn == nil {
-		conn = s.addrTable[addr.String()]
+		conn = s.table.GetAddr(addr)
 	}
 
 	if conn == nil {
@@ -157,7 +153,7 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 		}
 
 		logf(logTypeServer, "New server connection from addr %v", addr)
-		conn = newServerConnection(s.transFactory, addr, s.tls, &s.connectionTable)
+		conn = newServerConnection(s.transFactory, addr, s.tls, &s.table)
 		if conn == nil {
 			return nil, fatalError("unable to create server")
 		}
@@ -175,10 +171,6 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 		// to the table.  Firstly, to avoid having to remove it if there is an
 		// error, but also because the server-chosen connection ID isn't set
 		// until after the Initial is handled.
-
-		// TODO: have server connections manage their own entries in the table so
-		// that they can use NEW_CONNECTION_ID and connection migration.
-		s.addrTable[addr.String()] = conn
 		if s.handler != nil {
 			s.handler.NewConnection(conn)
 		}
@@ -188,7 +180,7 @@ func (s *Server) Input(packet *UdpPacket) (*Connection, error) {
 }
 
 func (s *Server) sendStatelessReset(cid ConnectionId, remoteAddr *net.UDPAddr) error {
-	token, err := s.GenerateResetToken(cid)
+	token, err := s.table.GenerateResetToken(cid)
 	if err != nil {
 		return err
 	}
@@ -222,7 +214,7 @@ func (s *Server) sendStatelessReset(cid ConnectionId, remoteAddr *net.UDPAddr) e
 
 // Check the server timers.
 func (s *Server) CheckTimer() error {
-	return s.connectionTable.All(func(conn *Connection) error {
+	return s.table.All(func(conn *Connection) error {
 		_, err := conn.CheckTimer()
 		if isFatalError(err) {
 			logf(logTypeServer, "Fatal Error %v killing connection %v", err, conn)
@@ -234,7 +226,12 @@ func (s *Server) CheckTimer() error {
 
 // How many connections do we have?
 func (s *Server) ConnectionCount() int {
-	return s.connectionTable.Count()
+	uniqueConnections := make(map[string]struct{})
+	s.table.All(func(conn *Connection) error {
+		uniqueConnections[conn.ServerId().String()] = struct{}{}
+		return nil
+	})
+	return len(uniqueConnections)
 }
 
 // Create a new QUIC server with the provide TLS config.
@@ -243,7 +240,7 @@ func NewServer(factory TransportFactory, tls *TlsConfig, handler ServerHandler) 
 		handler:      handler,
 		transFactory: factory,
 		tls:          tls,
-		connectionTable: connectionTable{
+		table: connectionTable{
 			idTable:   make(map[string]*Connection),
 			addrTable: make(map[string]*Connection),
 		},

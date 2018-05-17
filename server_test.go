@@ -76,7 +76,7 @@ func TestServer(t *testing.T) {
 	assertNotError(t, err, "Couldn't consume client initial")
 
 	assertX(t, s1 != s3, "Got the same server connection back with a different address")
-	assertEquals(t, 2, len(server.addrTable))
+	assertEquals(t, 2, server.ConnectionCount())
 }
 
 func TestServerIdleTimeout(t *testing.T) {
@@ -152,9 +152,7 @@ func TestServerStatelessReset(t *testing.T) {
 	snil, err := serverInputAll(t, serverTransport, server, dummyAddr2)
 	assertNotError(t, err, "Error processing CFIN")
 
-	snil.closingEnd = snil.closingEnd.Add(-1 - time.Second)
-	err = server.CheckTimer()
-	assertEquals(t, err, ErrorConnIsClosed)
+	drain(t, snil)
 	assertEquals(t, 0, server.ConnectionCount())
 
 	// Make a packet that seems to be for the now-removed connection.
