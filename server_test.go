@@ -1,6 +1,7 @@
 package minq
 
 import (
+	"bytes"
 	"crypto/rand"
 	"io"
 	"net"
@@ -113,7 +114,7 @@ func TestServerIdleTimeout(t *testing.T) {
 	assertEquals(t, 0, server.ConnectionCount())
 }
 
-func serverConnect(t *testing.T, client *Connection, server *Server, serverTransport *testTransport) {
+func serverConnect(t *testing.T, client *Connection, server *Server, serverTransport *testTransport) *Connection {
 	n, err := client.CheckTimer()
 	assertEquals(t, 1, n)
 	assertNotError(t, err, "Couldn't send client initial")
@@ -131,10 +132,12 @@ func serverConnect(t *testing.T, client *Connection, server *Server, serverTrans
 
 	assertEquals(t, client.GetState(), StateEstablished)
 	assertEquals(t, s2.GetState(), StateEstablished)
+	return s2
 }
 
 func TestServerStatelessReset(t *testing.T) {
 	cTrans, sTrans := newTestTransportPair(true)
+	clientTransport := cTrans.t
 	serverTransport := sTrans.t
 	server := NewServer(sTrans, testTlsConfig(), nil)
 	assertNotNil(t, server, "Couldn't make server")
@@ -142,25 +145,28 @@ func TestServerStatelessReset(t *testing.T) {
 	client := NewConnection(cTrans, dummyAddr1, testTlsConfig(), nil)
 	assertNotNil(t, client, "Couldn't make client")
 
-	serverConnect(t, client, server, serverTransport)
+	serverConnection := serverConnect(t, client, server, serverTransport)
 
-	cid := client.ServerId()
+	cid := serverConnection.ServerId()
 	resetToken := client.currentPath.resetToken
 	assertEquals(t, len(resetToken), 16)
 
-	client.Close()
-	snil, err := serverInputAll(t, serverTransport, server, dummyAddr2)
-	assertNotError(t, err, "Error processing CFIN")
-
-	drain(t, snil)
+	// Now close at the server end, but prevent the message from propagating.
+	serverTransport.w.autoFlush = false
+	serverConnection.Close()
+	drain(t, serverConnection)
 	assertEquals(t, 0, server.ConnectionCount())
 
 	// Make a packet that seems to be for the now-removed connection.
-	shortHeader := make([]byte, 50) // Got to be long enough.
-	shortHeader[0] = byte(packetFlagShortHeader)
-	copy(shortHeader[1:], cid) // Copy the connection ID in.
-	_, err = io.ReadFull(rand.Reader, shortHeader[1+len(cid):])
+	var statelessReset bytes.Buffer
+	_, err := statelessReset.Write([]byte{byte(packetFlagShortHeader)})
+	assertNotError(t, err, "set first octet")
+	_, err = io.Copy(&statelessReset, bytes.NewReader(cid))
+	assertNotError(t, err, "copy cid in")
+	_, err = io.CopyN(&statelessReset, rand.Reader, 22)
 	assertNotError(t, err, "random reading")
+	_, err = io.Copy(&statelessReset, bytes.NewReader(resetToken))
+	assertNotError(t, err, "append reset token")
 
 	// Make a new transport for the server, ignore the client side and just
 	// read the stateless reset from the buffer on the server side.
@@ -170,22 +176,28 @@ func TestServerStatelessReset(t *testing.T) {
 	_, err = server.Input(&UdpPacket{
 		DestAddr: dummyAddr1,
 		SrcAddr:  dummyAddr2,
-		Data:     shortHeader,
+		Data:     statelessReset.Bytes(),
 	})
 	assertError(t, err, "should generate an error")
 	assertEquals(t, len(serverTransport.w.in), 1)
 	packet := serverTransport.w.in[0].b
 	assertByteEquals(t, packet[len(packet)-len(resetToken):], resetToken)
 
-	_ = sTrans.newPairedTransport(false)
-	serverTransport = sTrans.t
+	// Now reset the client's input queue to include just the stateless reset
+	// and let the client consume the reset.
+	clientTransport.r.out = serverTransport.w.in
+	err = inputAll(client)
+	assertEquals(t, err, ErrorStatelessReset)
 
+	// Finally, ensure that a too-short packet doesn't cause the server to
+	// send a stateless reset.
+	_ = sTrans.newPairedTransport(false)
 	_, err = server.Input(&UdpPacket{
 		DestAddr: dummyAddr1,
 		SrcAddr:  dummyAddr2,
-		Data:     shortHeader[:18+len(cid)],
+		Data:     statelessReset.Bytes()[:18+len(cid)],
 	})
 	assertError(t, err, "should generate an error")
 	// Should have sent nothing though.
-	assertEquals(t, len(serverTransport.w.in), 0)
+	assertNotNil(t, sTrans.t, "the transport at the server should be unused")
 }

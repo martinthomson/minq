@@ -209,6 +209,7 @@ func (s *Server) sendStatelessReset(cid ConnectionId, remoteAddr *net.UDPAddr) e
 	if err != nil {
 		return err
 	}
+	logf(logTypeTrace, "Sending stateless reset %x", sr)
 	return t.Send(sr)
 }
 

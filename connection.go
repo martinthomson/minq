@@ -1064,6 +1064,10 @@ func (c *Connection) input(packet *UdpPacket) error {
 	}
 
 	if c.recvd.initialized() && !c.recvd.packetNotReceived(packetNumber) {
+		if c.isStatelessReset(&hdr, payload) {
+			c.log(logTypeConnection, "received stateless reset")
+			return ErrorStatelessReset
+		}
 		c.log(logTypeConnection, "Discarding duplicate packet %x", packetNumber)
 		return nonFatalError(fmt.Sprintf("Duplicate packet id %x", packetNumber))
 	}
@@ -1071,6 +1075,10 @@ func (c *Connection) input(packet *UdpPacket) error {
 	plaintext, err := aead.Open(nil, c.packetNonce(packetNumber),
 		payload[hdrlen:], payload[:hdrlen])
 	if err != nil {
+		if c.isStatelessReset(&hdr, payload) {
+			c.log(logTypeConnection, "received stateless reset")
+			return ErrorStatelessReset
+		}
 		c.log(logTypeConnection, "Could not unprotect packet %x", packet.Data)
 		return wrapE(ErrorInvalidPacket, err)
 	}
@@ -1181,6 +1189,21 @@ func (c *Connection) migrate(remoteAddr *net.UDPAddr) error {
 	}
 	c.currentPath = p
 	return nil
+}
+
+func (c *Connection) isStatelessReset(hdr *packetHeader, payload []byte) bool {
+	if hdr.Type.isLongHeader() {
+		return false
+	}
+	// Check all paths - this might have come in on an old path.
+	for _, p := range c.paths {
+		tail := payload[len(payload)-len(p.resetToken):]
+		if len(payload) > len(p.resetToken) &&
+			bytes.Equal(tail, p.resetToken) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Connection) processClientInitial(hdr *packetHeader, payload []byte) error {

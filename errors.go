@@ -94,6 +94,7 @@ var ErrorInvalidEncoding = fatalError("Invalid encoding")
 var ErrorProtocolViolation = fatalError("Protocol violation")
 var ErrorFrameFormatError = fatalError("Frame format error")
 var ErrorFlowControlError = fatalError("Flow control error")
+var ErrorStatelessReset = fatalError("Received stateless reset")
 
 // Protocol errors
 type ErrorCode uint16
